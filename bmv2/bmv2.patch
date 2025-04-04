@@ -1,0 +1,2529 @@
+From 8473c6840a281eb89e262a90d68d8eb56f0a9472 Mon Sep 17 00:00:00 2001
+From: nhnghia <huunghia.nguyen@montimage.eu>
+Date: Wed, 9 Oct 2024 14:34:38 +0200
+Subject: [PATCH 01/16] patch BMv2 to update skb->priority based on Vlan
+ priority-code-point
+
+---
+ src/BMI/bmi_interface.c | 56 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 56 insertions(+)
+
+diff --git a/src/BMI/bmi_interface.c b/src/BMI/bmi_interface.c
+index e7f9f7e95..0bcb656df 100644
+--- a/src/BMI/bmi_interface.c
++++ b/src/BMI/bmi_interface.c
+@@ -21,6 +21,7 @@
+ #include <string.h>
+ #include <stdlib.h>
+ #include <stdio.h>
++#include <sys/socket.h>
+ 
+ #include <pcap/pcap.h>
+ #include "bmi_interface.h"
+@@ -116,6 +117,55 @@ int bmi_interface_add_dumper(bmi_interface_t *bmi, const char *filename, bmi_dum
+   return 0;
+ }
+ 
++#define ETHERNET_HEADER_SIZE 14  // Ethernet header size (without VLAN tag)
++#define VLAN_TAG_SIZE 4          // VLAN tag size
++#define TPID_VLAN 0x8100         // TPID indicating a VLAN-tagged frame
++
++/* Structure of an Ethernet frame with a VLAN tag:
++
+++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++|    Destination MAC Address (6 bytes)                           |
+++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++|    Source MAC Address (6 bytes)                                |
+++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++|    EtherType (2 bytes) (0x8100 for VLAN Tag)                  |
+++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++|    VLAN ID (12 bits) | PCP (3 bits) | DEI (1 bit) | Reserved (2 bits) |
+++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++|    Payload/Data (46 - 1500 bytes)                              |
+++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++|    Frame Check Sequence (FCS) (4 bytes)                        |
+++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++*/
++
++// Function to extract the PCP field from a VLAN-tagged Ethernet frame
++int extract_pcp(const uint8_t *frame, size_t frame_length) {
++    if (frame_length < ETHERNET_HEADER_SIZE + VLAN_TAG_SIZE) {
++        //printf("Frame is too short to contain a VLAN tag.\n");
++        return -1;  // Indicate error
++    }
++
++    // Check if the frame contains a VLAN tag by examining the EtherType/TPID field
++    uint16_t ether_type;
++    memcpy(&ether_type, frame + 12, sizeof(ether_type));  // EtherType is after 12 bytes
++    ether_type = ntohs(ether_type);  // Convert from network byte order to host byte order
++
++    if (ether_type == TPID_VLAN) {
++        // Frame contains a VLAN tag
++        uint16_t tci;  // Tag Control Information (TCI)
++        memcpy(&tci, frame + ETHERNET_HEADER_SIZE, sizeof(tci));  // TCI starts after Ethernet header
++        tci = ntohs(tci);  // Convert from network byte order to host byte order
++
++        // Extract the PCP field (first 3 bits of TCI)
++        int pcp = (tci >> 13) & 0x07;  // Right shift by 13 bits, mask the first 3 bits (PCP)
++
++        return pcp;  // Return the extracted PCP value
++    } else {
++        //printf("No VLAN tag present in the frame.\n");
++        return -1;  // Indicate error
++    }
++}
++
+ int bmi_interface_send(bmi_interface_t *bmi, const char *data, int len) {
+   if(bmi->pcap_output_dumper) {
+     struct pcap_pkthdr pkt_header;
+@@ -127,6 +177,12 @@ int bmi_interface_send(bmi_interface_t *bmi, const char *data, int len) {
+ 	      (unsigned char *) data);
+     pcap_dump_flush(bmi->pcap_output_dumper);
+   }
++
++  //update skb->priority based on PCP field of vlan
++  int pcp = extract_pcp( data, len );
++  if( pcp >= 0 )
++    setsockopt(pcap_fileno(bmi->pcap), SOL_SOCKET, SO_PRIORITY, &pcp, sizeof(pcp));
++
+   return pcap_sendpacket(bmi->pcap, (unsigned char *) data, len);
+ }
+ 
+
+From fe50796f10e5d4d150b49674026edac16dcb1a5d Mon Sep 17 00:00:00 2001
+From: nhnghia <nhnghia@10.42.0.78>
+Date: Mon, 21 Oct 2024 15:27:12 +0200
+Subject: [PATCH 02/16] Expose igress timestamp, usec since Epoch, to P4
+
+---
+ docs/simple_switch.md                   |  3 +++
+ include/bm/bm_sim/switch.h              |  3 +++
+ src/BMI/bmi_interface.c                 | 18 ++++++++++++++++--
+ src/BMI/bmi_interface.h                 | 10 ++++++++--
+ src/bm_sim/switch.cpp                   |  7 +++++++
+ targets/simple_switch/simple_switch.cpp |  7 +++++++
+ 6 files changed, 44 insertions(+), 4 deletions(-)
+
+diff --git a/docs/simple_switch.md b/docs/simple_switch.md
+index ba1b76b0d..aba45be98 100644
+--- a/docs/simple_switch.md
++++ b/docs/simple_switch.md
+@@ -163,6 +163,7 @@ header_type intrinsic_metadata_t {
+     fields {
+         ingress_global_timestamp : 48;
+         egress_global_timestamp : 48;
++        ingress_system_timestamp: 64;
+         mcast_grp : 16;
+         egress_rid : 16;
+     }
+@@ -177,6 +178,8 @@ not be written to.  See Section [BMv2 timestamp implementation notes](#BMv2-time
+ starts egress processing. The clock is the same as for
+ `ingress_global_timestamp`. This field should only be read from the egress
+ pipeline, but should not be written to.
++- `ingress_system_timestamp`: a timestamp, in microsecond since the Epoch, 
++set when the packet arrives at the NIC which was assigned as an igress port.
+ - `mcast_grp`: needed for the multicast feature. This field needs to be written
+ in the ingress pipeline when you wish the packet to be multicast. A value of 0
+ means no multicast, and calling `mark_to_drop` will set the value to 0.
+diff --git a/include/bm/bm_sim/switch.h b/include/bm/bm_sim/switch.h
+index 1c898ffa6..3b39a1bd6 100644
+--- a/include/bm/bm_sim/switch.h
++++ b/include/bm/bm_sim/switch.h
+@@ -100,6 +100,9 @@ class Packet;
+ class SwitchWContexts : public DevMgr, public RuntimeInterface {
+   friend class Switch;
+ 
++protected:
++ struct timeval last_recv_pkt_timestamp;
++
+  public:
+   //! To enable live swapping of P4-JSON configurations, enable_swap needs to be
+   //! set to `true`. See switch.h documentation for more information on
+diff --git a/src/BMI/bmi_interface.c b/src/BMI/bmi_interface.c
+index 0bcb656df..9da0994ff 100644
+--- a/src/BMI/bmi_interface.c
++++ b/src/BMI/bmi_interface.c
+@@ -31,6 +31,7 @@ typedef struct bmi_interface_s {
+   int fd;
+   pcap_dumper_t *pcap_input_dumper;
+   pcap_dumper_t *pcap_output_dumper;
++  raw_packet_t last_recv_packet;
+ } bmi_interface_t;
+ 
+ /* static get_version(int *x, int *y, int *z) { */
+@@ -187,7 +188,7 @@ int bmi_interface_send(bmi_interface_t *bmi, const char *data, int len) {
+ }
+ 
+ /* Does not make a copy! */
+-int bmi_interface_recv(bmi_interface_t *bmi, const char **data) {
++int bmi_interface_recv(bmi_interface_t *bmi, const raw_packet_t **data) {
+   struct pcap_pkthdr *pkt_header;
+   const unsigned char *pkt_data;
+ 
+@@ -204,11 +205,24 @@ int bmi_interface_recv(bmi_interface_t *bmi, const char **data) {
+     pcap_dump_flush(bmi->pcap_input_dumper);
+   }
+ 
+-  *data = (const char *) pkt_data;
++  //*data = (const char *) pkt_data;
++
++  //expose more data than only packet data
++  //update stat
++  bmi->last_recv_packet.time = pkt_header->ts;
++  bmi->last_recv_packet.data = pkt_data;
++  bmi->last_recv_packet.len  = pkt_header->len;
++
++  *data = (const char*) &bmi->last_recv_packet;
+ 
+   return pkt_header->len;
+ }
+ 
++int bmi_interface_stat(bmi_interface_t *bmi, const bmi_interface_stat_t **stat){
++  *stat = &bmi->stat;
++  return 0;
++}
++
+ int bmi_interface_recv_with_copy(bmi_interface_t *bmi, char *data, int max_len) {
+   int rv;
+   struct pcap_pkthdr *pkt_header;
+diff --git a/src/BMI/bmi_interface.h b/src/BMI/bmi_interface.h
+index a25f5ad0a..102b6e1bd 100644
+--- a/src/BMI/bmi_interface.h
++++ b/src/BMI/bmi_interface.h
+@@ -28,7 +28,13 @@ typedef enum
+     bmi_input_dumper,
+     bmi_output_dumper
+ }  bmi_dumper_kind_t;
+-    
++
++typedef struct {
++  size_t time;
++  int len;
++  const char *data;
++} raw_packet_t;
++
+ int bmi_interface_create(bmi_interface_t **bmi, const char *device);
+ 
+ int bmi_interface_add_dumper(bmi_interface_t *bmi, const char *filename, bmi_dumper_kind_t dumper_kind);
+@@ -37,7 +43,7 @@ int bmi_interface_destroy(bmi_interface_t *bmi);
+ 
+ int bmi_interface_send(bmi_interface_t *bmi, const char *data, int len);
+ 
+-int bmi_interface_recv(bmi_interface_t *bmi, const char **data);
++int bmi_interface_recv(bmi_interface_t *bmi, const raw_packet_t **data);
+ 
+ int bmi_interface_recv_with_copy(bmi_interface_t *bmi, char *data, int max_len);
+ 
+diff --git a/src/bm_sim/switch.cpp b/src/bm_sim/switch.cpp
+index 5110a4d0d..1013d6dae 100644
+--- a/src/bm_sim/switch.cpp
++++ b/src/bm_sim/switch.cpp
+@@ -40,6 +40,7 @@
+ #include <boost/filesystem.hpp>
+ 
+ #include "md5.h"
++#include "bmi_interface.h"
+ 
+ namespace fs = boost::filesystem;
+ 
+@@ -70,6 +71,12 @@ SwitchWContexts::receive(port_t port_num, const char *buffer, int len) {
+     Logger::get()->info("Received packet of length {} on port {}: {}",
+                         len, port_num, sample_packet_data(buffer, len));
+   }
++
++  //decompose buffer which contains raw packet and metadata
++  const raw_packet_t *pkt = (raw_packet_t *) buffer;
++  last_recv_pkt_timestamp = pkt->time;
++  buffer = pkt->data;
++
+   return receive_(port_num, buffer, len);
+ }
+ 
+diff --git a/targets/simple_switch/simple_switch.cpp b/targets/simple_switch/simple_switch.cpp
+index dcb597fab..7efa5da55 100644
+--- a/targets/simple_switch/simple_switch.cpp
++++ b/targets/simple_switch/simple_switch.cpp
+@@ -265,6 +265,13 @@ SimpleSwitch::receive_(port_t port_num, const char *buffer, int len) {
+         .set(get_ts().count());
+   }
+ 
++  //expose incomming time of the raw packet
++  // in microsecond
++  if (phv->has_field("intrinsic_metadata.ingress_system_timestamp")) {
++    phv->get_field("intrinsic_metadata.ingress_system_timestamp")
++        .set( last_recv_pkt_timestamp.tv_sec * 1000000 + last_recv_pkt_timestamp.tv_usec );
++  }
++
+   input_buffer->push_front(
+       InputBuffer::PacketType::NORMAL, std::move(packet));
+   return 0;
+
+From b3f896e6f30a283dc4d72b729dc133ce8a257106 Mon Sep 17 00:00:00 2001
+From: nhnghia <nhnghia@10.42.0.78>
+Date: Mon, 21 Oct 2024 16:59:30 +0200
+Subject: [PATCH 03/16] uniform ingress_system_timestamp to
+ ingress_global_timestamp
+
+---
+ docs/simple_switch.md                   |  7 ++-----
+ targets/simple_switch/simple_switch.cpp | 11 +++--------
+ 2 files changed, 5 insertions(+), 13 deletions(-)
+
+diff --git a/docs/simple_switch.md b/docs/simple_switch.md
+index aba45be98..f958f46b8 100644
+--- a/docs/simple_switch.md
++++ b/docs/simple_switch.md
+@@ -163,21 +163,18 @@ header_type intrinsic_metadata_t {
+     fields {
+         ingress_global_timestamp : 48;
+         egress_global_timestamp : 48;
+-        ingress_system_timestamp: 64;
+         mcast_grp : 16;
+         egress_rid : 16;
+     }
+ }
+ metadata intrinsic_metadata_t intrinsic_metadata;
+ ```
+-- `ingress_global_timestamp`: a timestamp, in microseconds, set when the packet
+-shows up on ingress. The clock is set to 0 every time the switch starts. This
++- `ingress_global_timestamp`: a timestamp, in microsecond since the Epoch, 
++set when the packet arrives at the NIC which was assigned as an igress port. This
+ field can be read directly from either pipeline (ingress and egress) but should
+ not be written to.  See Section [BMv2 timestamp implementation notes](#BMv2-timestamp-implementation-notes) for more details.
+ - `egress_global_timestamp`: a timestamp, in microseconds, set when the packet
+ starts egress processing. The clock is the same as for
+-`ingress_global_timestamp`. This field should only be read from the egress
+-pipeline, but should not be written to.
+ - `ingress_system_timestamp`: a timestamp, in microsecond since the Epoch, 
+ set when the packet arrives at the NIC which was assigned as an igress port.
+ - `mcast_grp`: needed for the multicast feature. This field needs to be written
+diff --git a/targets/simple_switch/simple_switch.cpp b/targets/simple_switch/simple_switch.cpp
+index 7efa5da55..4bec57f6e 100644
+--- a/targets/simple_switch/simple_switch.cpp
++++ b/targets/simple_switch/simple_switch.cpp
+@@ -260,16 +260,11 @@ SimpleSwitch::receive_(port_t port_num, const char *buffer, int len) {
+   Field &f_instance_type = phv->get_field("standard_metadata.instance_type");
+   f_instance_type.set(PKT_INSTANCE_TYPE_NORMAL);
+ 
+-  if (phv->has_field("intrinsic_metadata.ingress_global_timestamp")) {
+-    phv->get_field("intrinsic_metadata.ingress_global_timestamp")
+-        .set(get_ts().count());
+-  }
+-
+   //expose incomming time of the raw packet
+   // in microsecond
+-  if (phv->has_field("intrinsic_metadata.ingress_system_timestamp")) {
+-    phv->get_field("intrinsic_metadata.ingress_system_timestamp")
+-        .set( last_recv_pkt_timestamp.tv_sec * 1000000 + last_recv_pkt_timestamp.tv_usec );
++  if (phv->has_field("intrinsic_metadata.ingress_global_timestamp")) {
++    phv->get_field("intrinsic_metadata.ingress_global_timestamp")
++        .set(last_recv_pkt_timestamp.tv_sec * 1000000 + last_recv_pkt_timestamp.tv_usec);
+   }
+ 
+   input_buffer->push_front(
+
+From df1da44aab20235fb30d3c3b7589fa0f3d3b5a26 Mon Sep 17 00:00:00 2001
+From: nhnghia <nhnghia@10.42.0.78>
+Date: Tue, 22 Oct 2024 16:52:10 +0200
+Subject: [PATCH 04/16] fixed bugs
+
+---
+ src/BMI/bmi_interface.c                 | 5 -----
+ src/BMI/bmi_interface.h                 | 2 +-
+ targets/simple_switch/simple_switch.cpp | 2 ++
+ 3 files changed, 3 insertions(+), 6 deletions(-)
+
+diff --git a/src/BMI/bmi_interface.c b/src/BMI/bmi_interface.c
+index 9da0994ff..1b4d276c9 100644
+--- a/src/BMI/bmi_interface.c
++++ b/src/BMI/bmi_interface.c
+@@ -218,11 +218,6 @@ int bmi_interface_recv(bmi_interface_t *bmi, const raw_packet_t **data) {
+   return pkt_header->len;
+ }
+ 
+-int bmi_interface_stat(bmi_interface_t *bmi, const bmi_interface_stat_t **stat){
+-  *stat = &bmi->stat;
+-  return 0;
+-}
+-
+ int bmi_interface_recv_with_copy(bmi_interface_t *bmi, char *data, int max_len) {
+   int rv;
+   struct pcap_pkthdr *pkt_header;
+diff --git a/src/BMI/bmi_interface.h b/src/BMI/bmi_interface.h
+index 102b6e1bd..7a60c7ed8 100644
+--- a/src/BMI/bmi_interface.h
++++ b/src/BMI/bmi_interface.h
+@@ -30,7 +30,7 @@ typedef enum
+ }  bmi_dumper_kind_t;
+ 
+ typedef struct {
+-  size_t time;
++  struct timeval time;
+   int len;
+   const char *data;
+ } raw_packet_t;
+diff --git a/targets/simple_switch/simple_switch.cpp b/targets/simple_switch/simple_switch.cpp
+index 4bec57f6e..290ece355 100644
+--- a/targets/simple_switch/simple_switch.cpp
++++ b/targets/simple_switch/simple_switch.cpp
+@@ -265,6 +265,8 @@ SimpleSwitch::receive_(port_t port_num, const char *buffer, int len) {
+   if (phv->has_field("intrinsic_metadata.ingress_global_timestamp")) {
+     phv->get_field("intrinsic_metadata.ingress_global_timestamp")
+         .set(last_recv_pkt_timestamp.tv_sec * 1000000 + last_recv_pkt_timestamp.tv_usec);
++
++    //printf("\n ts: %d, usec: %d", last_recv_pkt_timestamp.tv_sec , last_recv_pkt_timestamp.tv_usec );
+   }
+ 
+   input_buffer->push_front(
+
+From 7d37418912d89a8dfb853ab234f22202b8063708 Mon Sep 17 00:00:00 2001
+From: nhnghia <nhnghia@localhost>
+Date: Fri, 22 Nov 2024 21:05:55 +0100
+Subject: [PATCH 05/16] move epoch to startup time
+
+BMv2 model uses 48bits to store time. This is not enough to store
+microseconds since epoch.
+
+To avoid overflow, we shift time to startup moment of the switch
+(instead of epoch since 1970).
+---
+ targets/simple_switch/simple_switch.cpp | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/targets/simple_switch/simple_switch.cpp b/targets/simple_switch/simple_switch.cpp
+index 290ece355..cc2afda8f 100644
+--- a/targets/simple_switch/simple_switch.cpp
++++ b/targets/simple_switch/simple_switch.cpp
+@@ -263,10 +263,17 @@ SimpleSwitch::receive_(port_t port_num, const char *buffer, int len) {
+   //expose incomming time of the raw packet
+   // in microsecond
+   if (phv->has_field("intrinsic_metadata.ingress_global_timestamp")) {
++    // convert timeval to std::chrono
++    auto durationSinceEpoch = std::chrono::seconds{last_recv_pkt_timestamp.tv_sec} + std::chrono::microseconds{last_recv_pkt_timestamp.tv_usec};
++    clock::time_point duration = std::chrono::system_clock::time_point(durationSinceEpoch);
++
++    //shift forward to the startup moment of the switch
++    auto ts = std::chrono::duration_cast<ts_res>(duration - start );
++
+     phv->get_field("intrinsic_metadata.ingress_global_timestamp")
+-        .set(last_recv_pkt_timestamp.tv_sec * 1000000 + last_recv_pkt_timestamp.tv_usec);
++        .set( ts.count() );
+ 
+-    //printf("\n ts: %d, usec: %d", last_recv_pkt_timestamp.tv_sec , last_recv_pkt_timestamp.tv_usec );
++    printf("\n ingress_global_timestamp ts: %ld, usec: %ld", last_recv_pkt_timestamp.tv_sec , last_recv_pkt_timestamp.tv_usec );
+   }
+ 
+   input_buffer->push_front(
+
+From 8b319b7f5dc8212f89966fc27e39d0977abc1193 Mon Sep 17 00:00:00 2001
+From: nhnghia <nhnghia@localhost>
+Date: Thu, 28 Nov 2024 18:05:33 +0100
+Subject: [PATCH 06/16] expose rx & tx timestamps in nanosec
+
+---
+ .gitignore                              |   5 ++
+ include/bm/bm_sim/switch.h              |   2 +-
+ src/BMI/bmi_interface.c                 | 102 +++++++++++++++++++++++-
+ src/BMI/bmi_interface.h                 |   3 +-
+ src/bm_sim/switch.cpp                   |   8 +-
+ targets/simple_switch/simple_switch.cpp |  26 +++---
+ 6 files changed, 131 insertions(+), 15 deletions(-)
+
+diff --git a/.gitignore b/.gitignore
+index 97a0b2c38..86c839188 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -104,3 +104,8 @@ VERSION-build
+ 
+ core
+ vgcore*
++/.autotools
++/.cproject
++/.project
++/.settings/
++/.externalToolBuilders/
+diff --git a/include/bm/bm_sim/switch.h b/include/bm/bm_sim/switch.h
+index 3b39a1bd6..f3e146db5 100644
+--- a/include/bm/bm_sim/switch.h
++++ b/include/bm/bm_sim/switch.h
+@@ -101,7 +101,7 @@ class SwitchWContexts : public DevMgr, public RuntimeInterface {
+   friend class Switch;
+ 
+ protected:
+- struct timeval last_recv_pkt_timestamp;
++  std::chrono::high_resolution_clock::time_point rx_stamp_last_packet, tx_stamp_last_packet;
+ 
+  public:
+   //! To enable live swapping of P4-JSON configurations, enable_swap needs to be
+diff --git a/src/BMI/bmi_interface.c b/src/BMI/bmi_interface.c
+index 1b4d276c9..a7bf9cf80 100644
+--- a/src/BMI/bmi_interface.c
++++ b/src/BMI/bmi_interface.c
+@@ -24,6 +24,8 @@
+ #include <sys/socket.h>
+ 
+ #include <pcap/pcap.h>
++#include <errno.h>
++#include <linux/net_tstamp.h>
+ #include "bmi_interface.h"
+ 
+ typedef struct bmi_interface_s {
+@@ -75,6 +77,16 @@ int bmi_interface_create(bmi_interface_t **bmi, const char *device) {
+   }
+ #endif
+ 
++  // Set precision of timestamp to nanosecond
++  //   By default, time stamps are in microseconds.
++  // https://www.tcpdump.org/manpages/pcap_set_tstamp_precision.3pcap.html
++  if(pcap_set_tstamp_precision(bmi_->pcap, PCAP_TSTAMP_PRECISION_NANO) != 0){
++    printf("failled to the precision of the time stamp to nanosecond\n");
++    pcap_close(bmi_->pcap);
++    free(bmi_);
++    return -1;
++  }
++
+   if (pcap_activate(bmi_->pcap) != 0) {
+     pcap_close(bmi_->pcap);
+     free(bmi_);
+@@ -167,6 +179,74 @@ int extract_pcp(const uint8_t *frame, size_t frame_length) {
+     }
+ }
+ 
++
++int get_tx_timestamp( int sock, struct timespec *tx_timestamp ){
++	struct msghdr msg;
++	struct iovec iov;
++	char control[1024];
++	struct cmsghdr *cmsg;
++	int ret;
++	struct sockaddr_in from_addr;
++	char rcv_data[4096];
++
++	// Retrieve TX timestamp
++	memset(&iov, 0, sizeof(iov));
++	iov.iov_base = (void*) rcv_data;
++	iov.iov_len = sizeof(rcv_data);
++
++	memset(&msg, 0, sizeof(msg));
++	msg.msg_iov = &iov;
++	msg.msg_iovlen = 1;
++	msg.msg_control = control;
++	msg.msg_controllen = sizeof(control);
++
++	memset(&from_addr, 0, sizeof(from_addr));
++	msg.msg_name = (caddr_t)&from_addr;
++	msg.msg_namelen = sizeof(from_addr);
++
++	/*
++	 * Fetch message from error queue.
++	 * For transmit timestamps the outgoing packet is looped back to
++	 *   the socket"s error queue with the send timestamp(s) attached.
++	 * See 2.1.1 in https://www.kernel.org/doc/html/latest/networking/timestamping.html
++	 */
++	ret = recvmsg(sock, &msg, MSG_ERRQUEUE);
++	if( ret < 0 )
++		printf("recvmsg tx timestamp failed");
++
++	struct timeval now;
++	gettimeofday(&now, 0);
++
++	printf("%ld.%06ld: received %s data, %d bytes from %s, %zu bytes control messages\n",
++	       (long)now.tv_sec, (long)now.tv_usec,
++	       "regular",
++	       ret,
++		   inet_ntoa(from_addr.sin_addr),
++	       msg.msg_controllen);
++
++	// Parse control message for TX timestamp
++	for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
++		printf("   cmsg len %zu: ", cmsg->cmsg_len);
++		if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SO_TIMESTAMPING) {
++			struct timespec *ts = (struct timespec *)CMSG_DATA(cmsg);
++			tx_timestamp->tv_sec  = ts->tv_sec;
++			tx_timestamp->tv_nsec = ts->tv_nsec;
++
++			printf("SO_TIMESTAMPING ");
++			printf("SW %ld.%09ld ",
++			       (long)ts->tv_sec,
++			       (long)ts->tv_nsec);
++			ts++;
++							/* skip deprecated HW transformed */
++			ts++;
++			printf("HW raw %ld.%09ld \n",
++				   (long)ts->tv_sec,
++				   (long)ts->tv_nsec);
++			return 0;
++		}
++	}
++	return 1;
++}
+ int bmi_interface_send(bmi_interface_t *bmi, const char *data, int len) {
+   if(bmi->pcap_output_dumper) {
+     struct pcap_pkthdr pkt_header;
+@@ -182,9 +262,19 @@ int bmi_interface_send(bmi_interface_t *bmi, const char *data, int len) {
+   //update skb->priority based on PCP field of vlan
+   int pcp = extract_pcp( data, len );
+   if( pcp >= 0 )
+-    setsockopt(pcap_fileno(bmi->pcap), SOL_SOCKET, SO_PRIORITY, &pcp, sizeof(pcp));
++    setsockopt( bmi->fd, SOL_SOCKET, SO_PRIORITY, &pcp, sizeof(pcp));
++
++  int oval = SOF_TIMESTAMPING_TX_SOFTWARE | SOF_TIMESTAMPING_SOFTWARE;
++  if ( setsockopt( bmi->fd, SOL_SOCKET, SO_TIMESTAMPING, &oval, sizeof(oval) ) < 0 ){
++    printf("error when setting timestamping: %s\n", strerror(errno) );
++    exit(1);
++  }
+ 
+-  return pcap_sendpacket(bmi->pcap, (unsigned char *) data, len);
++  int ret = pcap_sendpacket(bmi->pcap, (unsigned char *) data, len);
++
++  get_tx_timestamp( bmi->fd, &bmi->last_recv_packet.last_tx_stamp );
++
++  return ret;
+ }
+ 
+ /* Does not make a copy! */
+@@ -209,7 +299,13 @@ int bmi_interface_recv(bmi_interface_t *bmi, const raw_packet_t **data) {
+ 
+   //expose more data than only packet data
+   //update stat
+-  bmi->last_recv_packet.time = pkt_header->ts;
++  // Attention: For backward compatibility, time stamps from a capture device
++  //   are always given in seconds and microseconds.
++  //   See https://www.tcpdump.org/manpages/pcap_set_tstamp_precision.3pcap.html
++  // As we set the precision to nanosecond, we need to "consider" tv_usec as tv_nsec
++  bmi->last_recv_packet.time.tv_sec  = pkt_header->ts.tv_sec;
++  bmi->last_recv_packet.time.tv_nsec = pkt_header->ts.tv_usec;
++
+   bmi->last_recv_packet.data = pkt_data;
+   bmi->last_recv_packet.len  = pkt_header->len;
+ 
+diff --git a/src/BMI/bmi_interface.h b/src/BMI/bmi_interface.h
+index 7a60c7ed8..6c3a2c7a0 100644
+--- a/src/BMI/bmi_interface.h
++++ b/src/BMI/bmi_interface.h
+@@ -30,9 +30,10 @@ typedef enum
+ }  bmi_dumper_kind_t;
+ 
+ typedef struct {
+-  struct timeval time;
++  struct timespec time;
+   int len;
+   const char *data;
++  struct timespec last_tx_stamp;
+ } raw_packet_t;
+ 
+ int bmi_interface_create(bmi_interface_t **bmi, const char *device);
+diff --git a/src/bm_sim/switch.cpp b/src/bm_sim/switch.cpp
+index 1013d6dae..ce3347873 100644
+--- a/src/bm_sim/switch.cpp
++++ b/src/bm_sim/switch.cpp
+@@ -74,7 +74,13 @@ SwitchWContexts::receive(port_t port_num, const char *buffer, int len) {
+ 
+   //decompose buffer which contains raw packet and metadata
+   const raw_packet_t *pkt = (raw_packet_t *) buffer;
+-  last_recv_pkt_timestamp = pkt->time;
++
++  auto d = std::chrono::seconds{pkt->time.tv_sec} + std::chrono::nanoseconds{pkt->time.tv_nsec};
++  rx_stamp_last_packet = std::chrono::system_clock::time_point( d );
++
++  d = std::chrono::seconds{pkt->last_tx_stamp.tv_sec} + std::chrono::nanoseconds{pkt->last_tx_stamp.tv_nsec};
++  tx_stamp_last_packet = std::chrono::system_clock::time_point( d );
++
+   buffer = pkt->data;
+ 
+   return receive_(port_num, buffer, len);
+diff --git a/targets/simple_switch/simple_switch.cpp b/targets/simple_switch/simple_switch.cpp
+index cc2afda8f..605757339 100644
+--- a/targets/simple_switch/simple_switch.cpp
++++ b/targets/simple_switch/simple_switch.cpp
+@@ -260,20 +260,28 @@ SimpleSwitch::receive_(port_t port_num, const char *buffer, int len) {
+   Field &f_instance_type = phv->get_field("standard_metadata.instance_type");
+   f_instance_type.set(PKT_INSTANCE_TYPE_NORMAL);
+ 
+-  //expose incomming time of the raw packet
+-  // in microsecond
+   if (phv->has_field("intrinsic_metadata.ingress_global_timestamp")) {
+-    // convert timeval to std::chrono
+-    auto durationSinceEpoch = std::chrono::seconds{last_recv_pkt_timestamp.tv_sec} + std::chrono::microseconds{last_recv_pkt_timestamp.tv_usec};
+-    clock::time_point duration = std::chrono::system_clock::time_point(durationSinceEpoch);
++    phv->get_field("intrinsic_metadata.ingress_global_timestamp")
++        .set(get_ts().count());
++  }
+ 
++  // expose incoming timestamp of the raw packet
++  // in nanosecond
++  // https://github.com/p4lang/p4c/blob/main/backends/tofino/bf-p4c/p4include/tofino2_base.p4#L135
++  if (phv->has_field("intrinsic_metadata.ingress_mac_tstamp")) {
+     //shift forward to the startup moment of the switch
+-    auto ts = std::chrono::duration_cast<ts_res>(duration - start );
+-
+-    phv->get_field("intrinsic_metadata.ingress_global_timestamp")
++    auto ts = std::chrono::duration_cast<tick>(rx_stamp_last_packet - start );
++    phv->get_field("intrinsic_metadata.ingress_mac_tstamp")
+         .set( ts.count() );
++  }
+ 
+-    printf("\n ingress_global_timestamp ts: %ld, usec: %ld", last_recv_pkt_timestamp.tv_sec , last_recv_pkt_timestamp.tv_usec );
++  // expose outgoing timestamp of the last packet, not the current one
++  // in nanosecond
++  if (phv->has_field("intrinsic_metadata.egress_mac_last_tstamp")) {
++    //shift forward to the startup moment of the switch
++    auto ts = std::chrono::duration_cast<tick>(tx_stamp_last_packet - start );
++    phv->get_field("intrinsic_metadata.egress_mac_last_tstamp")
++        .set( ts.count() );
+   }
+ 
+   input_buffer->push_front(
+
+From 51edf5b68085ded5be3ffa4a9e313733ee0428f9 Mon Sep 17 00:00:00 2001
+From: nhnghia <nhnghia@localhost>
+Date: Fri, 17 Jan 2025 15:58:44 +0100
+Subject: [PATCH 07/16] support external functions
+
+---
+ include/bm/bm_sim/packet.h              |   8 +-
+ include/bm/bm_sim/switch.h              |   1 -
+ src/BMI/bmi_interface.c                 |  38 +++-
+ src/BMI/bmi_interface.h                 |   9 +-
+ src/bm_sim/packet.cpp                   |   3 +
+ src/bm_sim/switch.cpp                   |  11 --
+ targets/simple_switch/primitives.cpp    | 245 ++++++++++++++++++++++++
+ targets/simple_switch/simple_switch.cpp |  58 ++++--
+ 8 files changed, 332 insertions(+), 41 deletions(-)
+
+diff --git a/include/bm/bm_sim/packet.h b/include/bm/bm_sim/packet.h
+index 0da8c2146..51f97cb5f 100644
+--- a/include/bm/bm_sim/packet.h
++++ b/include/bm/bm_sim/packet.h
+@@ -100,6 +100,13 @@ class Packet final {
+   friend class Switch;
+ 
+  public:
++  //HN
++  //timestamp, in nanosecond, representing arrival time of the packet at its input port
++  uint64_t ingress_mac_ts_ns{0};
++  // whether we need to capture the egress timestamp when the packet is sent out its egress port
++  bool need_to_capture_egress_mac_ts{false};
++
++
+   using clock = std::chrono::system_clock;
+ 
+   using buffer_state_t = PacketBuffer::state_t;
+@@ -384,7 +391,6 @@ class Packet final {
+   ErrorCode error_code{ErrorCode::make_invalid()};
+ 
+   bool checksum_error{false};
+-
+  private:
+   static CopyIdGenerator *copy_id_gen;
+ };
+diff --git a/include/bm/bm_sim/switch.h b/include/bm/bm_sim/switch.h
+index f3e146db5..0a5af65d9 100644
+--- a/include/bm/bm_sim/switch.h
++++ b/include/bm/bm_sim/switch.h
+@@ -101,7 +101,6 @@ class SwitchWContexts : public DevMgr, public RuntimeInterface {
+   friend class Switch;
+ 
+ protected:
+-  std::chrono::high_resolution_clock::time_point rx_stamp_last_packet, tx_stamp_last_packet;
+ 
+  public:
+   //! To enable live swapping of P4-JSON configurations, enable_swap needs to be
+diff --git a/src/BMI/bmi_interface.c b/src/BMI/bmi_interface.c
+index a7bf9cf80..81839a1e5 100644
+--- a/src/BMI/bmi_interface.c
++++ b/src/BMI/bmi_interface.c
+@@ -33,7 +33,10 @@ typedef struct bmi_interface_s {
+   int fd;
+   pcap_dumper_t *pcap_input_dumper;
+   pcap_dumper_t *pcap_output_dumper;
+-  raw_packet_t last_recv_packet;
++  struct {
++    struct timespec time;
++    const char *data;
++  } last_recv_packet;
+ } bmi_interface_t;
+ 
+ /* static get_version(int *x, int *y, int *z) { */
+@@ -81,7 +84,21 @@ int bmi_interface_create(bmi_interface_t **bmi, const char *device) {
+   //   By default, time stamps are in microseconds.
+   // https://www.tcpdump.org/manpages/pcap_set_tstamp_precision.3pcap.html
+   if(pcap_set_tstamp_precision(bmi_->pcap, PCAP_TSTAMP_PRECISION_NANO) != 0){
+-    printf("failled to the precision of the time stamp to nanosecond\n");
++    printf("failled to set the precision of the time stamp to nanosecond\n");
++    pcap_close(bmi_->pcap);
++    free(bmi_);
++    return -1;
++  }
++  /*
++  if( pcap_set_tstamp_type(bmi_->pcap, PCAP_TSTAMP_ADAPTER) != 0){
++    printf("failled to set the tstamp type\n");
++    pcap_close(bmi_->pcap);
++    free(bmi_);
++    return -1;
++  }
++  */
++  if( pcap_set_immediate_mode(bmi_->pcap, 1) != 0){
++    printf("failled to set immediate mode\n");
+     pcap_close(bmi_->pcap);
+     free(bmi_);
+     return -1;
+@@ -229,6 +246,7 @@ int get_tx_timestamp( int sock, struct timespec *tx_timestamp ){
+ 		printf("   cmsg len %zu: ", cmsg->cmsg_len);
+ 		if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SO_TIMESTAMPING) {
+ 			struct timespec *ts = (struct timespec *)CMSG_DATA(cmsg);
++			printf("   => timestamp: %lu.%09lu\n", ts->tv_sec, ts->tv_nsec);
+ 			tx_timestamp->tv_sec  = ts->tv_sec;
+ 			tx_timestamp->tv_nsec = ts->tv_nsec;
+ 
+@@ -248,6 +266,16 @@ int get_tx_timestamp( int sock, struct timespec *tx_timestamp ){
+ 	return 1;
+ }
+ int bmi_interface_send(bmi_interface_t *bmi, const char *data, int len) {
++
++  //HN: wrap data to a struct
++  struct {
++    struct timespec *tx_timestamp;
++    const void *data;
++  } *ptr = data;
++
++  data = ptr->data;
++  //
++
+   if(bmi->pcap_output_dumper) {
+     struct pcap_pkthdr pkt_header;
+     memset(&pkt_header, 0, sizeof(pkt_header));
+@@ -272,13 +300,14 @@ int bmi_interface_send(bmi_interface_t *bmi, const char *data, int len) {
+ 
+   int ret = pcap_sendpacket(bmi->pcap, (unsigned char *) data, len);
+ 
+-  get_tx_timestamp( bmi->fd, &bmi->last_recv_packet.last_tx_stamp );
++  if( ptr->tx_timestamp != NULL )
++    get_tx_timestamp( bmi->fd, ptr->tx_timestamp );
+ 
+   return ret;
+ }
+ 
+ /* Does not make a copy! */
+-int bmi_interface_recv(bmi_interface_t *bmi, const raw_packet_t **data) {
++int bmi_interface_recv(bmi_interface_t *bmi, const char **data) {
+   struct pcap_pkthdr *pkt_header;
+   const unsigned char *pkt_data;
+ 
+@@ -307,7 +336,6 @@ int bmi_interface_recv(bmi_interface_t *bmi, const raw_packet_t **data) {
+   bmi->last_recv_packet.time.tv_nsec = pkt_header->ts.tv_usec;
+ 
+   bmi->last_recv_packet.data = pkt_data;
+-  bmi->last_recv_packet.len  = pkt_header->len;
+ 
+   *data = (const char*) &bmi->last_recv_packet;
+ 
+diff --git a/src/BMI/bmi_interface.h b/src/BMI/bmi_interface.h
+index 6c3a2c7a0..2ce047344 100644
+--- a/src/BMI/bmi_interface.h
++++ b/src/BMI/bmi_interface.h
+@@ -29,13 +29,6 @@ typedef enum
+     bmi_output_dumper
+ }  bmi_dumper_kind_t;
+ 
+-typedef struct {
+-  struct timespec time;
+-  int len;
+-  const char *data;
+-  struct timespec last_tx_stamp;
+-} raw_packet_t;
+-
+ int bmi_interface_create(bmi_interface_t **bmi, const char *device);
+ 
+ int bmi_interface_add_dumper(bmi_interface_t *bmi, const char *filename, bmi_dumper_kind_t dumper_kind);
+@@ -44,7 +37,7 @@ int bmi_interface_destroy(bmi_interface_t *bmi);
+ 
+ int bmi_interface_send(bmi_interface_t *bmi, const char *data, int len);
+ 
+-int bmi_interface_recv(bmi_interface_t *bmi, const raw_packet_t **data);
++int bmi_interface_recv(bmi_interface_t *bmi, const char **data);
+ 
+ int bmi_interface_recv_with_copy(bmi_interface_t *bmi, char *data, int max_len);
+ 
+diff --git a/src/bm_sim/packet.cpp b/src/bm_sim/packet.cpp
+index a88302db3..e3ca9fcd0 100644
+--- a/src/bm_sim/packet.cpp
++++ b/src/bm_sim/packet.cpp
+@@ -238,6 +238,9 @@ Packet::operator=(Packet &&other) noexcept {
+   phv_source = other.phv_source;
+   registers = other.registers;
+ 
++  ingress_mac_ts_ns = other.ingress_mac_ts_ns;
++  need_to_capture_egress_mac_ts = other.need_to_capture_egress_mac_ts;
++
+   std::swap(buffer, other.buffer);
+   std::swap(phv, other.phv);
+ 
+diff --git a/src/bm_sim/switch.cpp b/src/bm_sim/switch.cpp
+index ce3347873..2acebf1c2 100644
+--- a/src/bm_sim/switch.cpp
++++ b/src/bm_sim/switch.cpp
+@@ -72,17 +72,6 @@ SwitchWContexts::receive(port_t port_num, const char *buffer, int len) {
+                         len, port_num, sample_packet_data(buffer, len));
+   }
+ 
+-  //decompose buffer which contains raw packet and metadata
+-  const raw_packet_t *pkt = (raw_packet_t *) buffer;
+-
+-  auto d = std::chrono::seconds{pkt->time.tv_sec} + std::chrono::nanoseconds{pkt->time.tv_nsec};
+-  rx_stamp_last_packet = std::chrono::system_clock::time_point( d );
+-
+-  d = std::chrono::seconds{pkt->last_tx_stamp.tv_sec} + std::chrono::nanoseconds{pkt->last_tx_stamp.tv_nsec};
+-  tx_stamp_last_packet = std::chrono::system_clock::time_point( d );
+-
+-  buffer = pkt->data;
+-
+   return receive_(port_num, buffer, len);
+ }
+ 
+diff --git a/targets/simple_switch/primitives.cpp b/targets/simple_switch/primitives.cpp
+index eef81b4a6..55a88ee20 100644
+--- a/targets/simple_switch/primitives.cpp
++++ b/targets/simple_switch/primitives.cpp
+@@ -480,3 +480,248 @@ int import_primitives(SimpleSwitch *sswitch) {
+   simple_switch = sswitch;
+   return 0;
+ }
++
++
++
++
++//HN
++/*
++ * Copyright 2025
++ * huunghia.nguyen@montimage.eu
++ *
++ * An example of external function is avail here:
++ *    https://github.com/p4lang/behavioral-model/tree/main/examples/custom_extern
++ */
++
++#include <stdio.h>
++#include <pthread.h>
++
++typedef struct element {
++  uint64_t clock_id;
++  uint16_t port_id;
++  uint16_t sequence_id;
++  uint64_t arrival_time;
++  uint64_t departure_time;
++  uint64_t packet_id;
++} element_t;
++
++typedef struct table {
++  size_t capacity;
++  size_t head;
++  size_t size;
++  pthread_mutex_t mtx; // Mutex for thread safety
++  element_t *data;
++} table_t;
++
++// Initialize the circular table
++table_t* table_init(size_t capacity) {
++  if (capacity == 0) {
++    fprintf(stderr, "Capacity must be greater than 0\n");
++    return NULL;
++  }
++  table_t *ct = (table_t*) malloc(sizeof(table_t));
++  ct->data = (element_t*) calloc(capacity, sizeof(element_t));
++  ct->capacity = capacity;
++  ct->head = 0;
++  ct->size = 0;
++  pthread_mutex_init(&ct->mtx, NULL);
++  return ct;
++}
++
++// Free the circular table
++void table_free(table_t *ct) {
++  if (ct) {
++    free(ct->data);
++    pthread_mutex_destroy(&ct->mtx);
++    free(ct);
++  }
++}
++
++// Add an element to the circular table
++void table_store(table_t *ct, element_t value) {
++
++  memcpy(& ct->data[ct->head], &value, sizeof(element_t)); // Add value at the current head position
++
++  ct->head = (ct->head + 1) % ct->capacity; // Move head to the next position
++  if (ct->size < ct->capacity) {
++    ++ct->size; // Increment size until it reaches capacity
++  }
++}
++
++bool table_get_departure_time(table_t *ct, uint64_t clock_id, uint16_t port_id,
++    uint16_t sequence_id, uint64_t *val) {
++  for (size_t i = 0; i < ct->size; ++i) {
++    size_t actualIndex = (ct->head + ct->capacity - ct->size + i) % ct->capacity;
++    const element_t *e = & ct->data[actualIndex];
++    if (e->clock_id == clock_id && e->port_id == port_id
++        && e->sequence_id == sequence_id) {
++      *val = e->departure_time;
++      return true;
++    }
++  }
++  return false; // Return false if the element is not found
++}
++
++bool table_get_arrival_time(table_t *ct, uint64_t clock_id, uint16_t port_id,
++    uint16_t sequence_id, uint64_t *val) {
++  for (size_t i = 0; i < ct->size; ++i) {
++    size_t actualIndex = (ct->head + ct->capacity - ct->size + i) % ct->capacity;
++    const element_t *e = & ct->data[actualIndex];
++    if (e->clock_id == clock_id && e->port_id == port_id
++        && e->sequence_id == sequence_id) {
++      *val = e->arrival_time;
++      return true;
++    }
++  }
++  return false; // Return false if the element is not found
++}
++
++bool table_update_departure_time(table_t *ct, uint64_t packet_id, uint64_t departure_time) {
++  for (size_t i = 0; i < ct->size; ++i) {
++    size_t actualIndex = (ct->head + ct->capacity - ct->size + i) % ct->capacity;
++    element_t *e = & ct->data[actualIndex];
++    if (e->packet_id == packet_id) {
++      e->departure_time = departure_time;
++      return true;
++    }
++  }
++  return false; // Return false if the element is not found
++}
++
++static table_t *table = NULL;
++
++// Example custom extern function.
++void ptp_counter_init(const bm::Data & b) {
++  if( table )
++    return;
++  size_t cap = b.get<size_t>();
++  if (cap == 0) {
++    cap = 1;
++    Logger::get()->warn("hash max given as 0, but treating it as 1");
++  }
++  table = table_init( cap );
++}
++
++BM_REGISTER_EXTERN_FUNCTION(ptp_counter_init, const bm::Data &);
++
++
++#include <execinfo.h>
++#include <stdio.h>
++#include <stdlib.h>
++/* Obtain a backtrace and print it to stderr. */
++void print_execution_trace (void) {
++  void *array[10];
++  size_t size;
++  char **strings;
++  size_t i;
++  size    = backtrace (array, 10);
++  strings = backtrace_symbols (array, size);
++
++  fprintf(stderr, "Execution trace:\n");
++
++  //i=2: ignore 2 first elements in trace as they are: this fun, then mmt_log
++  for (i = 2; i < size; i++){
++     fprintf(stderr, "\t %zu. %s\n", (i-1), strings[i]);
++
++     //DEBUG_MODE given by Makefile
++     /* find first occurence of '(' or ' ' in message[i] and assume
++      * everything before that is the file name. (Don't go beyond 0 though
++      * (string terminator)*/
++     size_t p = 0, size;
++     while(strings[i][p] != '(' && strings[i][p] != ' '
++        && strings[i][p] != 0)
++      ++p;
++
++     char syscom[256];
++
++
++     size = snprintf(syscom, sizeof( syscom ), "addr2line %p -e %.*s", array[i] , (int)p, strings[i] );
++     syscom[size] = '\0';
++     //last parameter is the filename of the symbol
++
++     fprintf(stderr, "\t    ");
++     if( system(syscom) ) {}
++  }
++  free (strings);
++}
++
++
++class ptp_store_arrival_time
++  : public ActionPrimitive<Data &, const Data &, const Data &> {
++  void operator ()(Data &clockId, const Data &portId, const Data &sequenceId) {
++    pthread_mutex_lock(&table->mtx); // Ensure thread safety
++    auto &packet = get_packet();
++
++    element_t elem;
++    memset(&elem, 0, sizeof(elem));
++    elem.clock_id = clockId.get<uint64_t>();
++    elem.port_id  = portId.get<uint16_t>();
++    elem.sequence_id = sequenceId.get<uint16_t>();
++    elem.arrival_time = packet.ingress_mac_ts_ns;
++    elem.packet_id = packet.get_packet_id();
++
++    printf("==%lu. store arrival time %lu of clock_id=%lu, port_id=%u, seq_id=%u\n",
++        elem.packet_id, elem.arrival_time, elem.clock_id, elem.port_id, elem.sequence_id);
++    table_store(table, elem);
++    print_execution_trace();
++    pthread_mutex_unlock(&table->mtx); // Ensure thread safety
++  }
++};
++
++REGISTER_PRIMITIVE(ptp_store_arrival_time);
++
++
++
++class ptp_capture_departure_time
++  : public ActionPrimitive<Data &, const Data &, const Data &> {
++  void operator ()(Data &clockId, const Data &portId, const Data &sequenceId) {
++    pthread_mutex_lock(&table->mtx); // Ensure thread safety
++    auto &packet = get_packet();
++
++    packet.need_to_capture_egress_mac_ts = true;
++    pthread_mutex_unlock(&table->mtx); // Ensure thread safety
++  }
++};
++REGISTER_PRIMITIVE(ptp_capture_departure_time);
++
++
++class ptp_get_delay_time
++  : public ActionPrimitive<Data &, const Data &, const Data &, Data &> {
++  void operator ()(Data &clockId, const Data &portId, const Data &sequenceId, Data &val) {
++    pthread_mutex_lock(&table->mtx); // Ensure thread safety
++    auto &packet = get_packet();
++
++    uint64_t clock_id = clockId.get<uint64_t>();
++    uint16_t port_id  = portId.get<uint16_t>();
++    uint16_t sequence_id = sequenceId.get<uint16_t>();
++
++    uint64_t arrival_ts, departure_ts, delay;
++    table_get_arrival_time( table, clock_id, port_id, sequence_id, &arrival_ts );
++    pthread_mutex_unlock(&table->mtx); // Ensure thread safety
++
++    departure_ts = 0;
++    // wait until we got departure_time
++    while( departure_ts == 0 ){
++      pthread_mutex_lock(&table->mtx); // Ensure thread safety
++      table_get_departure_time( table, clock_id, port_id, sequence_id, &departure_ts );
++      pthread_mutex_unlock(&table->mtx); // Ensure thread safety
++      usleep(100);
++    }
++
++    delay = 0;
++    if(departure_ts > arrival_ts)
++      delay = departure_ts - arrival_ts;
++    printf("== %lu. arrival_ts=%lu, depature_ts=%lu, delay=%lu\n", packet.get_packet_id(), arrival_ts, departure_ts, delay);
++    val.set( delay );
++
++  }
++};
++REGISTER_PRIMITIVE(ptp_get_delay_time);
++
++//this function is called by the switch after sending a packet to update its depature time
++void ptp_update_departure_time(uint64_t packet_id, uint64_t departure_time){
++  pthread_mutex_lock(&table->mtx); // Ensure thread safety
++  printf("== %lu. update depature_ts=%lu\n", packet_id, departure_time);
++  table_update_departure_time(table, packet_id, departure_time);
++  pthread_mutex_unlock(&table->mtx); // Ensure thread safety
++}
+diff --git a/targets/simple_switch/simple_switch.cpp b/targets/simple_switch/simple_switch.cpp
+index 605757339..5df70241d 100644
+--- a/targets/simple_switch/simple_switch.cpp
++++ b/targets/simple_switch/simple_switch.cpp
+@@ -236,6 +236,14 @@ SimpleSwitch::SimpleSwitch(bool enable_swap, port_t drop_port,
+ 
+ int
+ SimpleSwitch::receive_(port_t port_num, const char *buffer, int len) {
++  //decompose buffer which contains raw packet and metadata
++  typedef struct {
++    struct timespec time;
++    const char *data;
++  } raw_pkt_t;
++  raw_pkt_t *raw_pkt = (raw_pkt_t*) buffer;
++  buffer = raw_pkt->data;
++
+   // we limit the packet buffer to original size + 512 bytes, which means we
+   // cannot add more than 512 bytes of header data to the packet, which should
+   // be more than enough
+@@ -268,21 +276,13 @@ SimpleSwitch::receive_(port_t port_num, const char *buffer, int len) {
+   // expose incoming timestamp of the raw packet
+   // in nanosecond
+   // https://github.com/p4lang/p4c/blob/main/backends/tofino/bf-p4c/p4include/tofino2_base.p4#L135
+-  if (phv->has_field("intrinsic_metadata.ingress_mac_tstamp")) {
+-    //shift forward to the startup moment of the switch
+-    auto ts = std::chrono::duration_cast<tick>(rx_stamp_last_packet - start );
+-    phv->get_field("intrinsic_metadata.ingress_mac_tstamp")
+-        .set( ts.count() );
+-  }
++  //
++  auto d = std::chrono::seconds{raw_pkt->time.tv_sec} + std::chrono::nanoseconds{raw_pkt->time.tv_nsec};
++  auto ts_last_rx_packet = std::chrono::system_clock::time_point( d );
+ 
+-  // expose outgoing timestamp of the last packet, not the current one
+-  // in nanosecond
+-  if (phv->has_field("intrinsic_metadata.egress_mac_last_tstamp")) {
+-    //shift forward to the startup moment of the switch
+-    auto ts = std::chrono::duration_cast<tick>(tx_stamp_last_packet - start );
+-    phv->get_field("intrinsic_metadata.egress_mac_last_tstamp")
+-        .set( ts.count() );
+-  }
++  //shift forward to the startup moment of the switch
++  auto ts = std::chrono::duration_cast<ts_res>(ts_last_rx_packet - start );
++  packet->ingress_mac_ts_ns = ts.count();
+ 
+   input_buffer->push_front(
+       InputBuffer::PacketType::NORMAL, std::move(packet));
+@@ -400,6 +400,8 @@ SimpleSwitch::set_transmit_fn(TransmitFn fn) {
+   my_transmit_fn = std::move(fn);
+ }
+ 
++extern void ptp_update_departure_time(uint64_t packet_id, uint64_t departure_time);
++
+ void
+ SimpleSwitch::transmit_thread() {
+   while (1) {
+@@ -409,8 +411,34 @@ SimpleSwitch::transmit_thread() {
+     BMELOG(packet_out, *packet);
+     BMLOG_DEBUG_PKT(*packet, "Transmitting packet of size {} out of port {}",
+                     packet->get_data_size(), packet->get_egress_port());
++
++    //HN
++    struct timespec tx_timestamp; //store tx timestamp of the packet
++    struct {
++      struct timespec *tx_timestamp;
++      void *data;
++    } ptr;
++    ptr.data = packet->data();
++    ptr.tx_timestamp = &tx_timestamp;
++
++    if( packet->need_to_capture_egress_mac_ts == false )
++      ptr.tx_timestamp = NULL;
++    //
++
+     my_transmit_fn(packet->get_egress_port(), packet->get_packet_id(),
+-                   packet->data(), packet->get_data_size());
++                   (const char *)&ptr, packet->get_data_size());
++
++    if( ptr.tx_timestamp ){
++      auto d = std::chrono::seconds{tx_timestamp.tv_sec} + std::chrono::nanoseconds{tx_timestamp.tv_nsec};
++      auto ts_tx_packet = std::chrono::system_clock::time_point( d );
++      auto ts = std::chrono::duration_cast<ts_res>(ts_tx_packet - start );
++      //ts.count();
++      ptp_update_departure_time(packet->get_packet_id(), ts.count());
++    }
++    //end HN
++
++    //my_transmit_fn(packet->get_egress_port(), packet->get_packet_id(),
++    //               packet->data(), packet->get_data_size());
+   }
+ }
+ 
+
+From 7b73f82122780b5175e150aae64a3fc80d730c1b Mon Sep 17 00:00:00 2001
+From: nhnghia <nhnghia@localhost>
+Date: Fri, 17 Jan 2025 17:55:13 +0100
+Subject: [PATCH 08/16] fixed time error when no capturing tx_stamp
+
+---
+ src/BMI/bmi_interface.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/src/BMI/bmi_interface.c b/src/BMI/bmi_interface.c
+index 81839a1e5..0410e628b 100644
+--- a/src/BMI/bmi_interface.c
++++ b/src/BMI/bmi_interface.c
+@@ -292,7 +292,11 @@ int bmi_interface_send(bmi_interface_t *bmi, const char *data, int len) {
+   if( pcp >= 0 )
+     setsockopt( bmi->fd, SOL_SOCKET, SO_PRIORITY, &pcp, sizeof(pcp));
+ 
+-  int oval = SOF_TIMESTAMPING_TX_SOFTWARE | SOF_TIMESTAMPING_SOFTWARE;
++  int need_to_capture_tx_tstamp = (ptr->tx_timestamp != NULL);
++  int oval = 0; //disable by default
++  if( need_to_capture_tx_tstamp )
++    oval = SOF_TIMESTAMPING_TX_SOFTWARE | SOF_TIMESTAMPING_SOFTWARE;
++
+   if ( setsockopt( bmi->fd, SOL_SOCKET, SO_TIMESTAMPING, &oval, sizeof(oval) ) < 0 ){
+     printf("error when setting timestamping: %s\n", strerror(errno) );
+     exit(1);
+@@ -300,7 +304,7 @@ int bmi_interface_send(bmi_interface_t *bmi, const char *data, int len) {
+ 
+   int ret = pcap_sendpacket(bmi->pcap, (unsigned char *) data, len);
+ 
+-  if( ptr->tx_timestamp != NULL )
++  if( need_to_capture_tx_tstamp )
+     get_tx_timestamp( bmi->fd, ptr->tx_timestamp );
+ 
+   return ret;
+
+From 8140779db42d9f28fae8e3e520dbc1741c839633 Mon Sep 17 00:00:00 2001
+From: nhnghia <nhnghia@localhost>
+Date: Fri, 17 Jan 2025 17:55:24 +0100
+Subject: [PATCH 09/16] standardize external function names
+
+---
+ targets/simple_switch/primitives.cpp | 218 ++++++++++++++-------------
+ 1 file changed, 110 insertions(+), 108 deletions(-)
+
+diff --git a/targets/simple_switch/primitives.cpp b/targets/simple_switch/primitives.cpp
+index 55a88ee20..efe5903b1 100644
+--- a/targets/simple_switch/primitives.cpp
++++ b/targets/simple_switch/primitives.cpp
+@@ -496,6 +496,8 @@ int import_primitives(SimpleSwitch *sswitch) {
+ #include <stdio.h>
+ #include <pthread.h>
+ 
++/////a circular table///////
++
+ typedef struct element {
+   uint64_t clock_id;
+   uint16_t port_id;
+@@ -509,22 +511,16 @@ typedef struct table {
+   size_t capacity;
+   size_t head;
+   size_t size;
+-  pthread_mutex_t mtx; // Mutex for thread safety
+   element_t *data;
+ } table_t;
+ 
+ // Initialize the circular table
+ table_t* table_init(size_t capacity) {
+-  if (capacity == 0) {
+-    fprintf(stderr, "Capacity must be greater than 0\n");
+-    return NULL;
+-  }
+   table_t *ct = (table_t*) malloc(sizeof(table_t));
+   ct->data = (element_t*) calloc(capacity, sizeof(element_t));
+   ct->capacity = capacity;
+   ct->head = 0;
+   ct->size = 0;
+-  pthread_mutex_init(&ct->mtx, NULL);
+   return ct;
+ }
+ 
+@@ -532,7 +528,6 @@ table_t* table_init(size_t capacity) {
+ void table_free(table_t *ct) {
+   if (ct) {
+     free(ct->data);
+-    pthread_mutex_destroy(&ct->mtx);
+     free(ct);
+   }
+ }
+@@ -548,47 +543,35 @@ void table_store(table_t *ct, element_t value) {
+   }
+ }
+ 
+-bool table_get_departure_time(table_t *ct, uint64_t clock_id, uint16_t port_id,
+-    uint16_t sequence_id, uint64_t *val) {
++element_t * table_find(table_t *ct, uint64_t clock_id, uint16_t port_id,
++    uint16_t sequence_id) {
+   for (size_t i = 0; i < ct->size; ++i) {
+     size_t actualIndex = (ct->head + ct->capacity - ct->size + i) % ct->capacity;
+-    const element_t *e = & ct->data[actualIndex];
+-    if (e->clock_id == clock_id && e->port_id == port_id
+-        && e->sequence_id == sequence_id) {
+-      *val = e->departure_time;
+-      return true;
+-    }
+-  }
+-  return false; // Return false if the element is not found
+-}
+-
+-bool table_get_arrival_time(table_t *ct, uint64_t clock_id, uint16_t port_id,
+-    uint16_t sequence_id, uint64_t *val) {
+-  for (size_t i = 0; i < ct->size; ++i) {
+-    size_t actualIndex = (ct->head + ct->capacity - ct->size + i) % ct->capacity;
+-    const element_t *e = & ct->data[actualIndex];
++    element_t *e = & ct->data[actualIndex];
+     if (e->clock_id == clock_id && e->port_id == port_id
+         && e->sequence_id == sequence_id) {
+-      *val = e->arrival_time;
+-      return true;
++      return e;
+     }
+   }
+-  return false; // Return false if the element is not found
++  return NULL;
+ }
+ 
+-bool table_update_departure_time(table_t *ct, uint64_t packet_id, uint64_t departure_time) {
++element_t * table_find_by_packet_id(table_t *ct, uint64_t packet_id) {
+   for (size_t i = 0; i < ct->size; ++i) {
+     size_t actualIndex = (ct->head + ct->capacity - ct->size + i) % ct->capacity;
+     element_t *e = & ct->data[actualIndex];
+-    if (e->packet_id == packet_id) {
+-      e->departure_time = departure_time;
+-      return true;
+-    }
++    if (e->packet_id == packet_id)
++      return e;
+   }
+-  return false; // Return false if the element is not found
++  return NULL;
+ }
+ 
++
++
++/////end of circular table///////
++
+ static table_t *table = NULL;
++static pthread_mutex_t mutex; // Mutex for thread safety
+ 
+ // Example custom extern function.
+ void ptp_counter_init(const bm::Data & b) {
+@@ -600,59 +583,19 @@ void ptp_counter_init(const bm::Data & b) {
+     Logger::get()->warn("hash max given as 0, but treating it as 1");
+   }
+   table = table_init( cap );
++  pthread_mutex_init(&mutex, NULL);
+ }
+ 
+ BM_REGISTER_EXTERN_FUNCTION(ptp_counter_init, const bm::Data &);
+ 
+ 
+-#include <execinfo.h>
+-#include <stdio.h>
+-#include <stdlib.h>
+-/* Obtain a backtrace and print it to stderr. */
+-void print_execution_trace (void) {
+-  void *array[10];
+-  size_t size;
+-  char **strings;
+-  size_t i;
+-  size    = backtrace (array, 10);
+-  strings = backtrace_symbols (array, size);
+-
+-  fprintf(stderr, "Execution trace:\n");
+-
+-  //i=2: ignore 2 first elements in trace as they are: this fun, then mmt_log
+-  for (i = 2; i < size; i++){
+-     fprintf(stderr, "\t %zu. %s\n", (i-1), strings[i]);
+-
+-     //DEBUG_MODE given by Makefile
+-     /* find first occurence of '(' or ' ' in message[i] and assume
+-      * everything before that is the file name. (Don't go beyond 0 though
+-      * (string terminator)*/
+-     size_t p = 0, size;
+-     while(strings[i][p] != '(' && strings[i][p] != ' '
+-        && strings[i][p] != 0)
+-      ++p;
+-
+-     char syscom[256];
+-
+-
+-     size = snprintf(syscom, sizeof( syscom ), "addr2line %p -e %.*s", array[i] , (int)p, strings[i] );
+-     syscom[size] = '\0';
+-     //last parameter is the filename of the symbol
+-
+-     fprintf(stderr, "\t    ");
+-     if( system(syscom) ) {}
+-  }
+-  free (strings);
+-}
+-
+-
+-class ptp_store_arrival_time
++class ptp_store_ingress_mac_tstamp
+   : public ActionPrimitive<Data &, const Data &, const Data &> {
+   void operator ()(Data &clockId, const Data &portId, const Data &sequenceId) {
+-    pthread_mutex_lock(&table->mtx); // Ensure thread safety
++    pthread_mutex_lock(&mutex); // Ensure thread safety
+     auto &packet = get_packet();
+ 
+-    element_t elem;
++    element_t elem, *ex;
+     memset(&elem, 0, sizeof(elem));
+     elem.clock_id = clockId.get<uint64_t>();
+     elem.port_id  = portId.get<uint16_t>();
+@@ -660,68 +603,127 @@ class ptp_store_arrival_time
+     elem.arrival_time = packet.ingress_mac_ts_ns;
+     elem.packet_id = packet.get_packet_id();
+ 
+-    printf("==%lu. store arrival time %lu of clock_id=%lu, port_id=%u, seq_id=%u\n",
+-        elem.packet_id, elem.arrival_time, elem.clock_id, elem.port_id, elem.sequence_id);
+-    table_store(table, elem);
+-    print_execution_trace();
+-    pthread_mutex_unlock(&table->mtx); // Ensure thread safety
++    Logger::get()->info("Store arrival time {} of clock_id={}, port_id={}, seq_id={} of packet {}",
++        elem.arrival_time, elem.clock_id, elem.port_id, elem.sequence_id, elem.packet_id);
++
++    //perhaps we got another packet having the same 3-tuple (clock_id, port_id, seq_id)
++    // => ignore the latest one
++    ex = table_find(table, elem.clock_id, elem.port_id, elem.sequence_id);
++    if( ex != NULL)
++      Logger::get()->warn("Duplication detected (clock_id={}, port_id={}, seq_id={} was seen at packet {}). Ignore",
++          ex->clock_id, ex->port_id, ex->sequence_id, ex->packet_id);
++    else
++      table_store(table, elem);
++
++    pthread_mutex_unlock(&mutex); // Ensure thread safety
+   }
+ };
+ 
+-REGISTER_PRIMITIVE(ptp_store_arrival_time);
++REGISTER_PRIMITIVE(ptp_store_ingress_mac_tstamp);
+ 
+ 
+ 
+-class ptp_capture_departure_time
++class ptp_capture_egress_mac_tstamp
+   : public ActionPrimitive<Data &, const Data &, const Data &> {
+   void operator ()(Data &clockId, const Data &portId, const Data &sequenceId) {
+-    pthread_mutex_lock(&table->mtx); // Ensure thread safety
++    pthread_mutex_lock(&mutex); // Ensure thread safety
+     auto &packet = get_packet();
+ 
+     packet.need_to_capture_egress_mac_ts = true;
+-    pthread_mutex_unlock(&table->mtx); // Ensure thread safety
++    pthread_mutex_unlock(&mutex); // Ensure thread safety
+   }
+ };
+-REGISTER_PRIMITIVE(ptp_capture_departure_time);
++REGISTER_PRIMITIVE(ptp_capture_egress_mac_tstamp);
+ 
+ 
+-class ptp_get_delay_time
++class get_ingress_mac_tstamp
+   : public ActionPrimitive<Data &, const Data &, const Data &, Data &> {
+   void operator ()(Data &clockId, const Data &portId, const Data &sequenceId, Data &val) {
+-    pthread_mutex_lock(&table->mtx); // Ensure thread safety
++    pthread_mutex_lock(&mutex); // Ensure thread safety
++
+     auto &packet = get_packet();
++    val.set( packet.ingress_mac_ts_ns );
++    pthread_mutex_unlock(&mutex); // Ensure thread safety
++
++  }
++};
++REGISTER_PRIMITIVE(get_ingress_mac_tstamp);
+ 
++
++class ptp_get_egress_mac_tstamp
++  : public ActionPrimitive<Data &, const Data &, const Data &, Data &> {
++  void operator ()(Data &clockId, const Data &portId, const Data &sequenceId, Data &val) {
+     uint64_t clock_id = clockId.get<uint64_t>();
+     uint16_t port_id  = portId.get<uint16_t>();
+     uint16_t sequence_id = sequenceId.get<uint16_t>();
+ 
+-    uint64_t arrival_ts, departure_ts, delay;
+-    table_get_arrival_time( table, clock_id, port_id, sequence_id, &arrival_ts );
+-    pthread_mutex_unlock(&table->mtx); // Ensure thread safety
++    uint64_t departure_ts;
++    element_t *elem;
+ 
+     departure_ts = 0;
++
++
+     // wait until we got departure_time
+-    while( departure_ts == 0 ){
+-      pthread_mutex_lock(&table->mtx); // Ensure thread safety
+-      table_get_departure_time( table, clock_id, port_id, sequence_id, &departure_ts );
+-      pthread_mutex_unlock(&table->mtx); // Ensure thread safety
+-      usleep(100);
++    while( 1 ){
++      pthread_mutex_lock(&mutex); // Ensure thread safety
++      elem = table_find( table, clock_id, port_id, sequence_id );
++      if( elem != NULL )
++        departure_ts = elem->departure_time;
++      pthread_mutex_unlock(&mutex); // Ensure thread safety
++
++      if(elem == NULL)
++        break;
++
++      if( departure_ts != 0 )
++        break;
++      else
++        usleep(100);
+     }
+ 
+-    delay = 0;
+-    if(departure_ts > arrival_ts)
+-      delay = departure_ts - arrival_ts;
+-    printf("== %lu. arrival_ts=%lu, depature_ts=%lu, delay=%lu\n", packet.get_packet_id(), arrival_ts, departure_ts, delay);
+-    val.set( delay );
++    val.set( departure_ts );
++
++  }
++};
++REGISTER_PRIMITIVE(ptp_get_egress_mac_tstamp);
++
++
++
++class ptp_get_ingress_mac_tstamp
++  : public ActionPrimitive<Data &, const Data &, const Data &, Data &> {
++  void operator ()(Data &clockId, const Data &portId, const Data &sequenceId, Data &val) {
++    pthread_mutex_lock(&mutex); // Ensure thread safety
++
++    uint64_t clock_id = clockId.get<uint64_t>();
++    uint16_t port_id  = portId.get<uint16_t>();
++    uint16_t sequence_id = sequenceId.get<uint16_t>();
++
++    uint64_t arrival_ts = 0;
++    element_t *elem;
++
++    elem = table_find( table, clock_id, port_id, sequence_id );
++    if( elem != NULL )
++      arrival_ts = elem->arrival_time;
++
++    val.set( arrival_ts );
++    pthread_mutex_unlock(&mutex); // Ensure thread safety
+ 
+   }
+ };
+-REGISTER_PRIMITIVE(ptp_get_delay_time);
++REGISTER_PRIMITIVE(ptp_get_ingress_mac_tstamp);
++
+ 
+ //this function is called by the switch after sending a packet to update its depature time
+ void ptp_update_departure_time(uint64_t packet_id, uint64_t departure_time){
+-  pthread_mutex_lock(&table->mtx); // Ensure thread safety
+-  printf("== %lu. update depature_ts=%lu\n", packet_id, departure_time);
+-  table_update_departure_time(table, packet_id, departure_time);
+-  pthread_mutex_unlock(&table->mtx); // Ensure thread safety
+-}
++  element_t *elem;
++  pthread_mutex_lock(&mutex); // Ensure thread safety
++
++  Logger::get()->info("Update depature_ts={} of packet {}", departure_time, packet_id);
++
++  elem = table_find_by_packet_id(table, packet_id);
++  if( elem )
++    elem->departure_time = departure_time;
++  else
++    Logger::get()->warn("No place for departure time. The packet %{} was not stored.", packet_id);
++
++  pthread_mutex_unlock(&mutex); // Ensure thread safety
++};
+
+From 75b404277d48ce8b5bca0d145e538f488c4c7b55 Mon Sep 17 00:00:00 2001
+From: nhnghia <nhnghia@localhost>
+Date: Tue, 21 Jan 2025 17:56:45 +0100
+Subject: [PATCH 10/16] change rx/tx mac timestamp from micro to nanosec
+
+---
+ targets/simple_switch/primitives.cpp    | 1 +
+ targets/simple_switch/simple_switch.cpp | 4 ++--
+ 2 files changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/targets/simple_switch/primitives.cpp b/targets/simple_switch/primitives.cpp
+index efe5903b1..25a3f102f 100644
+--- a/targets/simple_switch/primitives.cpp
++++ b/targets/simple_switch/primitives.cpp
+@@ -584,6 +584,7 @@ void ptp_counter_init(const bm::Data & b) {
+   }
+   table = table_init( cap );
+   pthread_mutex_init(&mutex, NULL);
++  Logger::get()->info("Init ptp counter table size {}", cap);
+ }
+ 
+ BM_REGISTER_EXTERN_FUNCTION(ptp_counter_init, const bm::Data &);
+diff --git a/targets/simple_switch/simple_switch.cpp b/targets/simple_switch/simple_switch.cpp
+index 5df70241d..4f0d1f24f 100644
+--- a/targets/simple_switch/simple_switch.cpp
++++ b/targets/simple_switch/simple_switch.cpp
+@@ -281,7 +281,7 @@ SimpleSwitch::receive_(port_t port_num, const char *buffer, int len) {
+   auto ts_last_rx_packet = std::chrono::system_clock::time_point( d );
+ 
+   //shift forward to the startup moment of the switch
+-  auto ts = std::chrono::duration_cast<ts_res>(ts_last_rx_packet - start );
++  auto ts = std::chrono::duration_cast<std::chrono::nanoseconds>(ts_last_rx_packet - start );
+   packet->ingress_mac_ts_ns = ts.count();
+ 
+   input_buffer->push_front(
+@@ -431,7 +431,7 @@ SimpleSwitch::transmit_thread() {
+     if( ptr.tx_timestamp ){
+       auto d = std::chrono::seconds{tx_timestamp.tv_sec} + std::chrono::nanoseconds{tx_timestamp.tv_nsec};
+       auto ts_tx_packet = std::chrono::system_clock::time_point( d );
+-      auto ts = std::chrono::duration_cast<ts_res>(ts_tx_packet - start );
++      auto ts = std::chrono::duration_cast<std::chrono::nanoseconds>(ts_tx_packet - start );
+       //ts.count();
+       ptp_update_departure_time(packet->get_packet_id(), ts.count());
+     }
+
+From 8cf07aac34ec392fcdbd69f68b3705b74bec515c Mon Sep 17 00:00:00 2001
+From: nhnghia <nhnghia@localhost>
+Date: Wed, 22 Jan 2025 21:33:49 +0100
+Subject: [PATCH 11/16] use debug log level instead of info
+
+---
+ src/BMI/bmi_interface.c              | 178 ++++++++++++++-------------
+ targets/simple_switch/primitives.cpp |  74 ++++++++---
+ 2 files changed, 151 insertions(+), 101 deletions(-)
+
+diff --git a/src/BMI/bmi_interface.c b/src/BMI/bmi_interface.c
+index 0410e628b..30f6b09de 100644
+--- a/src/BMI/bmi_interface.c
++++ b/src/BMI/bmi_interface.c
+@@ -170,101 +170,107 @@ int bmi_interface_add_dumper(bmi_interface_t *bmi, const char *filename, bmi_dum
+ 
+ // Function to extract the PCP field from a VLAN-tagged Ethernet frame
+ int extract_pcp(const uint8_t *frame, size_t frame_length) {
+-    if (frame_length < ETHERNET_HEADER_SIZE + VLAN_TAG_SIZE) {
+-        //printf("Frame is too short to contain a VLAN tag.\n");
+-        return -1;  // Indicate error
+-    }
++  if (frame_length < ETHERNET_HEADER_SIZE + VLAN_TAG_SIZE) {
++    //printf("Frame is too short to contain a VLAN tag.\n");
++    return -1;  // Indicate error
++  }
+ 
+-    // Check if the frame contains a VLAN tag by examining the EtherType/TPID field
+-    uint16_t ether_type;
+-    memcpy(&ether_type, frame + 12, sizeof(ether_type));  // EtherType is after 12 bytes
+-    ether_type = ntohs(ether_type);  // Convert from network byte order to host byte order
++  // Check if the frame contains a VLAN tag by examining the EtherType/TPID field
++  uint16_t ether_type;
++  memcpy(&ether_type, frame + 12, sizeof(ether_type));  // EtherType is after 12 bytes
++  ether_type = ntohs(ether_type);  // Convert from network byte order to host byte order
+ 
+-    if (ether_type == TPID_VLAN) {
+-        // Frame contains a VLAN tag
+-        uint16_t tci;  // Tag Control Information (TCI)
+-        memcpy(&tci, frame + ETHERNET_HEADER_SIZE, sizeof(tci));  // TCI starts after Ethernet header
+-        tci = ntohs(tci);  // Convert from network byte order to host byte order
++  if (ether_type == TPID_VLAN) {
++    // Frame contains a VLAN tag
++    uint16_t tci;  // Tag Control Information (TCI)
++    memcpy(&tci, frame + ETHERNET_HEADER_SIZE, sizeof(tci));  // TCI starts after Ethernet header
++    tci = ntohs(tci);  // Convert from network byte order to host byte order
+ 
+-        // Extract the PCP field (first 3 bits of TCI)
+-        int pcp = (tci >> 13) & 0x07;  // Right shift by 13 bits, mask the first 3 bits (PCP)
++    // Extract the PCP field (first 3 bits of TCI)
++    int pcp = (tci >> 13) & 0x07;  // Right shift by 13 bits, mask the first 3 bits (PCP)
+ 
+-        return pcp;  // Return the extracted PCP value
+-    } else {
+-        //printf("No VLAN tag present in the frame.\n");
+-        return -1;  // Indicate error
+-    }
++    return pcp;  // Return the extracted PCP value
++  } else {
++    //printf("No VLAN tag present in the frame.\n");
++    return -1;  // Indicate error
++  }
+ }
+ 
+ 
+ int get_tx_timestamp( int sock, struct timespec *tx_timestamp ){
+-	struct msghdr msg;
+-	struct iovec iov;
+-	char control[1024];
+-	struct cmsghdr *cmsg;
+-	int ret;
+-	struct sockaddr_in from_addr;
+-	char rcv_data[4096];
+-
+-	// Retrieve TX timestamp
+-	memset(&iov, 0, sizeof(iov));
+-	iov.iov_base = (void*) rcv_data;
+-	iov.iov_len = sizeof(rcv_data);
+-
+-	memset(&msg, 0, sizeof(msg));
+-	msg.msg_iov = &iov;
+-	msg.msg_iovlen = 1;
+-	msg.msg_control = control;
+-	msg.msg_controllen = sizeof(control);
+-
+-	memset(&from_addr, 0, sizeof(from_addr));
+-	msg.msg_name = (caddr_t)&from_addr;
+-	msg.msg_namelen = sizeof(from_addr);
+-
+-	/*
+-	 * Fetch message from error queue.
+-	 * For transmit timestamps the outgoing packet is looped back to
+-	 *   the socket"s error queue with the send timestamp(s) attached.
+-	 * See 2.1.1 in https://www.kernel.org/doc/html/latest/networking/timestamping.html
+-	 */
+-	ret = recvmsg(sock, &msg, MSG_ERRQUEUE);
+-	if( ret < 0 )
+-		printf("recvmsg tx timestamp failed");
+-
+-	struct timeval now;
+-	gettimeofday(&now, 0);
+-
+-	printf("%ld.%06ld: received %s data, %d bytes from %s, %zu bytes control messages\n",
+-	       (long)now.tv_sec, (long)now.tv_usec,
+-	       "regular",
+-	       ret,
+-		   inet_ntoa(from_addr.sin_addr),
+-	       msg.msg_controllen);
+-
+-	// Parse control message for TX timestamp
+-	for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+-		printf("   cmsg len %zu: ", cmsg->cmsg_len);
+-		if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SO_TIMESTAMPING) {
+-			struct timespec *ts = (struct timespec *)CMSG_DATA(cmsg);
+-			printf("   => timestamp: %lu.%09lu\n", ts->tv_sec, ts->tv_nsec);
+-			tx_timestamp->tv_sec  = ts->tv_sec;
+-			tx_timestamp->tv_nsec = ts->tv_nsec;
+-
+-			printf("SO_TIMESTAMPING ");
+-			printf("SW %ld.%09ld ",
+-			       (long)ts->tv_sec,
+-			       (long)ts->tv_nsec);
+-			ts++;
+-							/* skip deprecated HW transformed */
+-			ts++;
+-			printf("HW raw %ld.%09ld \n",
+-				   (long)ts->tv_sec,
+-				   (long)ts->tv_nsec);
+-			return 0;
+-		}
+-	}
+-	return 1;
++  struct msghdr msg;
++  struct iovec iov;
++  char control[1024];
++  struct cmsghdr *cmsg;
++  int ret;
++  struct sockaddr_in from_addr;
++  char rcv_data[4096];
++
++  // Retrieve TX timestamp
++  memset(&iov, 0, sizeof(iov));
++  iov.iov_base = (void*) rcv_data;
++  iov.iov_len = sizeof(rcv_data);
++
++  memset(&msg, 0, sizeof(msg));
++  msg.msg_iov = &iov;
++  msg.msg_iovlen = 1;
++  msg.msg_control = control;
++  msg.msg_controllen = sizeof(control);
++
++  memset(&from_addr, 0, sizeof(from_addr));
++  msg.msg_name = (caddr_t)&from_addr;
++  msg.msg_namelen = sizeof(from_addr);
++
++  struct timeval now;
++  gettimeofday(&now, 0);
++
++  /*
++   * Fetch message from error queue.
++   * For transmit timestamps the outgoing packet is looped back to
++   *   the socket"s error queue with the send timestamp(s) attached.
++   * See 2.1.1 in https://www.kernel.org/doc/html/latest/networking/timestamping.html
++   */
++  ret = recvmsg(sock, &msg, MSG_ERRQUEUE);
++  if( ret < 0 ){
++    printf("%ld.%06ld: recvmsg tx timestamp failed (%d: %s)\n",
++        (long)now.tv_sec, (long)now.tv_usec,
++        errno, strerror(errno));
++    return 1;
++  }
++
++  //printf("%ld.%06ld: received %s data, %d bytes from %s, %zu bytes control messages\n",
++  //       (long)now.tv_sec, (long)now.tv_usec,
++  //       "regular",
++  //       ret,
++  //	   inet_ntoa(from_addr.sin_addr),
++  //       msg.msg_controllen);
++
++  // Parse control message for TX timestamp
++  for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
++    //printf("   cmsg len %zu: ", cmsg->cmsg_len);
++    if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SO_TIMESTAMPING) {
++      struct timespec *ts = (struct timespec *)CMSG_DATA(cmsg);
++      //printf("   => timestamp: %lu.%09lu\n", ts->tv_sec, ts->tv_nsec);
++      tx_timestamp->tv_sec  = ts->tv_sec;
++      tx_timestamp->tv_nsec = ts->tv_nsec;
++
++      //printf("SO_TIMESTAMPING ");
++      //printf("SW %ld.%09ld ",
++      //       (long)ts->tv_sec,
++      //       (long)ts->tv_nsec);
++      //ts++;
++      /* skip deprecated HW transformed */
++      //ts++;
++      //printf("HW raw %ld.%09ld \n",
++      //	   (long)ts->tv_sec,
++      //	   (long)ts->tv_nsec);
++      return 0;
++    }
++  }
++  return 1;
+ }
++
++
+ int bmi_interface_send(bmi_interface_t *bmi, const char *data, int len) {
+ 
+   //HN: wrap data to a struct
+diff --git a/targets/simple_switch/primitives.cpp b/targets/simple_switch/primitives.cpp
+index 25a3f102f..65ddd0c85 100644
+--- a/targets/simple_switch/primitives.cpp
++++ b/targets/simple_switch/primitives.cpp
+@@ -604,7 +604,7 @@ class ptp_store_ingress_mac_tstamp
+     elem.arrival_time = packet.ingress_mac_ts_ns;
+     elem.packet_id = packet.get_packet_id();
+ 
+-    Logger::get()->info("Store arrival time {} of clock_id={}, port_id={}, seq_id={} of packet {}",
++    Logger::get()->debug("Store arrival time {} of clock_id={}, port_id={}, seq_id={} of packet {}",
+         elem.arrival_time, elem.clock_id, elem.port_id, elem.sequence_id, elem.packet_id);
+ 
+     //perhaps we got another packet having the same 3-tuple (clock_id, port_id, seq_id)
+@@ -630,33 +630,44 @@ class ptp_capture_egress_mac_tstamp
+     pthread_mutex_lock(&mutex); // Ensure thread safety
+     auto &packet = get_packet();
+ 
+-    packet.need_to_capture_egress_mac_ts = true;
+-    pthread_mutex_unlock(&mutex); // Ensure thread safety
+-  }
+-};
+-REGISTER_PRIMITIVE(ptp_capture_egress_mac_tstamp);
++    //store a placeholder in the table if it is not existing
++    element_t elem, *ex;
++    memset(&elem, 0, sizeof(elem));
++    elem.clock_id = clockId.get<uint64_t>();
++    elem.port_id  = portId.get<uint16_t>();
++    elem.sequence_id = sequenceId.get<uint16_t>();
++    elem.packet_id = packet.get_packet_id();
+ 
++    Logger::get()->debug("Enable to capture depature time of clock_id={}, port_id={}, seq_id={} of packet {}",
++        elem.clock_id, elem.port_id, elem.sequence_id, elem.packet_id);
+ 
+-class get_ingress_mac_tstamp
+-  : public ActionPrimitive<Data &, const Data &, const Data &, Data &> {
+-  void operator ()(Data &clockId, const Data &portId, const Data &sequenceId, Data &val) {
+-    pthread_mutex_lock(&mutex); // Ensure thread safety
++    //perhaps we got another packet having the same 3-tuple (clock_id, port_id, seq_id)
++    // this happens when ptp_store_ingress_mac_tstamp was called before this function
++    // => ignore
++    ex = table_find(table, elem.clock_id, elem.port_id, elem.sequence_id);
++    if( ex == NULL)
++      table_store(table, elem);
+ 
+-    auto &packet = get_packet();
+-    val.set( packet.ingress_mac_ts_ns );
+-    pthread_mutex_unlock(&mutex); // Ensure thread safety
+ 
++    packet.need_to_capture_egress_mac_ts = true;
++    pthread_mutex_unlock(&mutex); // Ensure thread safety
+   }
+ };
+-REGISTER_PRIMITIVE(get_ingress_mac_tstamp);
++REGISTER_PRIMITIVE(ptp_capture_egress_mac_tstamp);
++
+ 
+ 
++/**
++ * Get egress_mac_tstamp of the packet which was required to capture this value
++ * when calling ptp_capture_egress_mac_tstamp
++ */
+ class ptp_get_egress_mac_tstamp
+   : public ActionPrimitive<Data &, const Data &, const Data &, Data &> {
+   void operator ()(Data &clockId, const Data &portId, const Data &sequenceId, Data &val) {
+     uint64_t clock_id = clockId.get<uint64_t>();
+     uint16_t port_id  = portId.get<uint16_t>();
+     uint16_t sequence_id = sequenceId.get<uint16_t>();
++    auto &packet = get_packet();
+ 
+     uint64_t departure_ts;
+     element_t *elem;
+@@ -672,8 +683,12 @@ class ptp_get_egress_mac_tstamp
+         departure_ts = elem->departure_time;
+       pthread_mutex_unlock(&mutex); // Ensure thread safety
+ 
+-      if(elem == NULL)
++      if(elem == NULL){
++        Logger::get()->warn("Trying to get egress_mac_tstamp of packet(clock_id={}, port_id={}, seq_id={}) from packet {}, "
++            "but not found. You need to require to capture egress_mac_tstamp of that packet beforehand.",
++            clock_id, port_id, sequence_id, packet.get_packet_id());
+         break;
++      }
+ 
+       if( departure_ts != 0 )
+         break;
+@@ -681,6 +696,10 @@ class ptp_get_egress_mac_tstamp
+         usleep(100);
+     }
+ 
++    if( elem )
++      Logger::get()->debug("Got egress_mac_tstamp {} of clock_id={}, port_id={}, seq_id={} of packet {}",
++        departure_ts, clock_id, port_id, sequence_id, elem->packet_id);
++
+     val.set( departure_ts );
+ 
+   }
+@@ -689,6 +708,23 @@ REGISTER_PRIMITIVE(ptp_get_egress_mac_tstamp);
+ 
+ 
+ 
++/**
++ * Get ingress_mac_tstamp of the current packet
++ */
++class get_ingress_mac_tstamp
++  : public ActionPrimitive<Data &, const Data &, const Data &, Data &> {
++  void operator ()(Data &clockId, const Data &portId, const Data &sequenceId, Data &val) {
++    auto &packet = get_packet();
++    val.set( packet.ingress_mac_ts_ns );
++  }
++};
++REGISTER_PRIMITIVE(get_ingress_mac_tstamp);
++
++
++/**
++ * Get ingress_mac_tstamp of a packet whose tstamp was stored
++ *  when calling ptp_store_ingress_mac_tstamp
++ */
+ class ptp_get_ingress_mac_tstamp
+   : public ActionPrimitive<Data &, const Data &, const Data &, Data &> {
+   void operator ()(Data &clockId, const Data &portId, const Data &sequenceId, Data &val) {
+@@ -705,6 +741,10 @@ class ptp_get_ingress_mac_tstamp
+     if( elem != NULL )
+       arrival_ts = elem->arrival_time;
+ 
++    Logger::get()->debug("Got arrival time {} of clock_id={}, port_id={}, seq_id={} of packet {}",
++        arrival_ts, elem->clock_id, elem->port_id, elem->sequence_id, elem->packet_id);
++
++
+     val.set( arrival_ts );
+     pthread_mutex_unlock(&mutex); // Ensure thread safety
+ 
+@@ -726,5 +766,9 @@ void ptp_update_departure_time(uint64_t packet_id, uint64_t departure_time){
+   else
+     Logger::get()->warn("No place for departure time. The packet %{} was not stored.", packet_id);
+ 
++  Logger::get()->debug("Store depature time {} of clock_id={}, port_id={}, seq_id={} of packet {}",
++      departure_time, elem->clock_id, elem->port_id, elem->sequence_id, elem->packet_id);
++
++
+   pthread_mutex_unlock(&mutex); // Ensure thread safety
+ };
+
+From b07690c08adfaaa6d3d28b3f036cbbf0928b8d5c Mon Sep 17 00:00:00 2001
+From: nhnghia <nhnghia@localhost>
+Date: Thu, 23 Jan 2025 10:43:19 +0100
+Subject: [PATCH 12/16] Update log message format
+
+---
+ targets/simple_switch/primitives.cpp | 7 +++----
+ 1 file changed, 3 insertions(+), 4 deletions(-)
+
+diff --git a/targets/simple_switch/primitives.cpp b/targets/simple_switch/primitives.cpp
+index 65ddd0c85..3f0e3f1df 100644
+--- a/targets/simple_switch/primitives.cpp
++++ b/targets/simple_switch/primitives.cpp
+@@ -604,7 +604,7 @@ class ptp_store_ingress_mac_tstamp
+     elem.arrival_time = packet.ingress_mac_ts_ns;
+     elem.packet_id = packet.get_packet_id();
+ 
+-    Logger::get()->debug("Store arrival time {} of clock_id={}, port_id={}, seq_id={} of packet {}",
++    Logger::get()->debug("Store ingress_mac_tstamp {} of clock_id={}, port_id={}, seq_id={} of packet {}",
+         elem.arrival_time, elem.clock_id, elem.port_id, elem.sequence_id, elem.packet_id);
+ 
+     //perhaps we got another packet having the same 3-tuple (clock_id, port_id, seq_id)
+@@ -638,7 +638,7 @@ class ptp_capture_egress_mac_tstamp
+     elem.sequence_id = sequenceId.get<uint16_t>();
+     elem.packet_id = packet.get_packet_id();
+ 
+-    Logger::get()->debug("Enable to capture depature time of clock_id={}, port_id={}, seq_id={} of packet {}",
++    Logger::get()->debug("Enable to capture egress_mac_tstamp of clock_id={}, port_id={}, seq_id={} of packet {}",
+         elem.clock_id, elem.port_id, elem.sequence_id, elem.packet_id);
+ 
+     //perhaps we got another packet having the same 3-tuple (clock_id, port_id, seq_id)
+@@ -758,7 +758,6 @@ void ptp_update_departure_time(uint64_t packet_id, uint64_t departure_time){
+   element_t *elem;
+   pthread_mutex_lock(&mutex); // Ensure thread safety
+ 
+-  Logger::get()->info("Update depature_ts={} of packet {}", departure_time, packet_id);
+ 
+   elem = table_find_by_packet_id(table, packet_id);
+   if( elem )
+@@ -766,7 +765,7 @@ void ptp_update_departure_time(uint64_t packet_id, uint64_t departure_time){
+   else
+     Logger::get()->warn("No place for departure time. The packet %{} was not stored.", packet_id);
+ 
+-  Logger::get()->debug("Store depature time {} of clock_id={}, port_id={}, seq_id={} of packet {}",
++  Logger::get()->debug("Store egress_mac_tstamp {} of clock_id={}, port_id={}, seq_id={} of packet {}",
+       departure_time, elem->clock_id, elem->port_id, elem->sequence_id, elem->packet_id);
+ 
+ 
+
+From 8892a94dbcaf1a5e16d06b3cbd01ca7200d00e70 Mon Sep 17 00:00:00 2001
+From: nhnghia <nhnghia@localhost>
+Date: Fri, 14 Feb 2025 11:56:26 +0100
+Subject: [PATCH 13/16] Use number of nanoseconds since epoch as timestamps
+
+---
+ targets/simple_switch/primitives.cpp    | 15 +++++++++------
+ targets/simple_switch/simple_switch.cpp | 15 ++++-----------
+ 2 files changed, 13 insertions(+), 17 deletions(-)
+
+diff --git a/targets/simple_switch/primitives.cpp b/targets/simple_switch/primitives.cpp
+index 3f0e3f1df..d4c452601 100644
+--- a/targets/simple_switch/primitives.cpp
++++ b/targets/simple_switch/primitives.cpp
+@@ -692,8 +692,11 @@ class ptp_get_egress_mac_tstamp
+ 
+       if( departure_ts != 0 )
+         break;
+-      else
+-        usleep(100);
++      else{
++        Logger::get()->debug("Wait for egress_mac_tstamp {} of clock_id={}, port_id={}, seq_id={} of packet {}",
++                departure_ts, clock_id, port_id, sequence_id, elem->packet_id);
++        usleep(10);
++      }
+     }
+ 
+     if( elem )
+@@ -756,18 +759,18 @@ REGISTER_PRIMITIVE(ptp_get_ingress_mac_tstamp);
+ //this function is called by the switch after sending a packet to update its depature time
+ void ptp_update_departure_time(uint64_t packet_id, uint64_t departure_time){
+   element_t *elem;
+-  pthread_mutex_lock(&mutex); // Ensure thread safety
+ 
++  pthread_mutex_lock(&mutex); // Ensure thread safety
+ 
+   elem = table_find_by_packet_id(table, packet_id);
+   if( elem )
+     elem->departure_time = departure_time;
+-  else
++  pthread_mutex_unlock(&mutex); // Ensure thread safety
++
++  if( !elem )
+     Logger::get()->warn("No place for departure time. The packet %{} was not stored.", packet_id);
+ 
+   Logger::get()->debug("Store egress_mac_tstamp {} of clock_id={}, port_id={}, seq_id={} of packet {}",
+       departure_time, elem->clock_id, elem->port_id, elem->sequence_id, elem->packet_id);
+ 
+-
+-  pthread_mutex_unlock(&mutex); // Ensure thread safety
+ };
+diff --git a/targets/simple_switch/simple_switch.cpp b/targets/simple_switch/simple_switch.cpp
+index 4f0d1f24f..69317a6f7 100644
+--- a/targets/simple_switch/simple_switch.cpp
++++ b/targets/simple_switch/simple_switch.cpp
+@@ -277,12 +277,8 @@ SimpleSwitch::receive_(port_t port_num, const char *buffer, int len) {
+   // in nanosecond
+   // https://github.com/p4lang/p4c/blob/main/backends/tofino/bf-p4c/p4include/tofino2_base.p4#L135
+   //
+-  auto d = std::chrono::seconds{raw_pkt->time.tv_sec} + std::chrono::nanoseconds{raw_pkt->time.tv_nsec};
+-  auto ts_last_rx_packet = std::chrono::system_clock::time_point( d );
+-
+-  //shift forward to the startup moment of the switch
+-  auto ts = std::chrono::duration_cast<std::chrono::nanoseconds>(ts_last_rx_packet - start );
+-  packet->ingress_mac_ts_ns = ts.count();
++  //use number of nanosecond since epoch
++  packet->ingress_mac_ts_ns = raw_pkt->time.tv_sec * 1000*1000*1000 + raw_pkt->time.tv_nsec;
+ 
+   input_buffer->push_front(
+       InputBuffer::PacketType::NORMAL, std::move(packet));
+@@ -429,11 +425,8 @@ SimpleSwitch::transmit_thread() {
+                    (const char *)&ptr, packet->get_data_size());
+ 
+     if( ptr.tx_timestamp ){
+-      auto d = std::chrono::seconds{tx_timestamp.tv_sec} + std::chrono::nanoseconds{tx_timestamp.tv_nsec};
+-      auto ts_tx_packet = std::chrono::system_clock::time_point( d );
+-      auto ts = std::chrono::duration_cast<std::chrono::nanoseconds>(ts_tx_packet - start );
+-      //ts.count();
+-      ptp_update_departure_time(packet->get_packet_id(), ts.count());
++      //use number of nanosecond since epoch
++      ptp_update_departure_time(packet->get_packet_id(), tx_timestamp.tv_sec * 1000*1000*1000 + tx_timestamp.tv_nsec);
+     }
+     //end HN
+ 
+
+From 84a8b551f5040a065712f5c49bbe8dec9b4e6ec4 Mon Sep 17 00:00:00 2001
+From: nhnghia <nhnghia@localhost>
+Date: Wed, 19 Feb 2025 14:12:33 +0100
+Subject: [PATCH 14/16] set libpcap on non-blocking mode
+
+---
+ src/BMI/bmi_interface.c              | 30 +++++++++++------
+ targets/simple_switch/primitives.cpp | 48 +++++++++++++++-------------
+ 2 files changed, 47 insertions(+), 31 deletions(-)
+
+diff --git a/src/BMI/bmi_interface.c b/src/BMI/bmi_interface.c
+index 30f6b09de..dd3be2626 100644
+--- a/src/BMI/bmi_interface.c
++++ b/src/BMI/bmi_interface.c
+@@ -25,6 +25,7 @@
+ 
+ #include <pcap/pcap.h>
+ #include <errno.h>
++#include <time.h>
+ #include <linux/net_tstamp.h>
+ #include "bmi_interface.h"
+ 
+@@ -97,6 +98,7 @@ int bmi_interface_create(bmi_interface_t **bmi, const char *device) {
+     return -1;
+   }
+   */
++  //packets are delivered immediately as they arrive, instead of being buffered.
+   if( pcap_set_immediate_mode(bmi_->pcap, 1) != 0){
+     printf("failled to set immediate mode\n");
+     pcap_close(bmi_->pcap);
+@@ -104,6 +106,15 @@ int bmi_interface_create(bmi_interface_t **bmi, const char *device) {
+     return -1;
+   }
+ 
++  //pcap_dispatch() or pcap_next_ex() operates in non-blocking mode.
++  // e.g., these functions return immediately even if no packets are available.
++  if( pcap_setnonblock(bmi_->pcap, 1, errbuf) != 0){
++    printf("failled to set nonblock mode: %s\n", errbuf);
++    pcap_close(bmi_->pcap);
++    free(bmi_);
++    return -1;
++  }
++
+   if (pcap_activate(bmi_->pcap) != 0) {
+     pcap_close(bmi_->pcap);
+     free(bmi_);
+@@ -222,7 +233,10 @@ int get_tx_timestamp( int sock, struct timespec *tx_timestamp ){
+   msg.msg_namelen = sizeof(from_addr);
+ 
+   struct timeval now;
+-  gettimeofday(&now, 0);
++
++  //struct timespec start_ts, end_ts;
++  //clock_gettime(CLOCK_REALTIME, &start_ts);
++  //printf("starting get tx_timestamp at: %ld.%09ld\n", start_ts.tv_sec, start_ts.tv_nsec);
+ 
+   /*
+    * Fetch message from error queue.
+@@ -232,19 +246,13 @@ int get_tx_timestamp( int sock, struct timespec *tx_timestamp ){
+    */
+   ret = recvmsg(sock, &msg, MSG_ERRQUEUE);
+   if( ret < 0 ){
++    gettimeofday(&now, 0);
+     printf("%ld.%06ld: recvmsg tx timestamp failed (%d: %s)\n",
+         (long)now.tv_sec, (long)now.tv_usec,
+         errno, strerror(errno));
+     return 1;
+   }
+ 
+-  //printf("%ld.%06ld: received %s data, %d bytes from %s, %zu bytes control messages\n",
+-  //       (long)now.tv_sec, (long)now.tv_usec,
+-  //       "regular",
+-  //       ret,
+-  //	   inet_ntoa(from_addr.sin_addr),
+-  //       msg.msg_controllen);
+-
+   // Parse control message for TX timestamp
+   for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+     //printf("   cmsg len %zu: ", cmsg->cmsg_len);
+@@ -264,6 +272,8 @@ int get_tx_timestamp( int sock, struct timespec *tx_timestamp ){
+       //printf("HW raw %ld.%09ld \n",
+       //	   (long)ts->tv_sec,
+       //	   (long)ts->tv_nsec);
++      //clock_gettime(CLOCK_REALTIME, &end_ts);
++      //printf("time to get tx_timestamp: %ld ns\n", (end_ts.tv_sec - start_ts.tv_sec)*1000*1000*1000 + (end_ts.tv_nsec - start_ts.tv_nsec) );
+       return 0;
+     }
+   }
+@@ -304,11 +314,13 @@ int bmi_interface_send(bmi_interface_t *bmi, const char *data, int len) {
+     oval = SOF_TIMESTAMPING_TX_SOFTWARE | SOF_TIMESTAMPING_SOFTWARE;
+ 
+   if ( setsockopt( bmi->fd, SOL_SOCKET, SO_TIMESTAMPING, &oval, sizeof(oval) ) < 0 ){
+-    printf("error when setting timestamping: %s\n", strerror(errno) );
++    fprintf(stderr, "error when setting timestamping: %s\n", strerror(errno) );
+     exit(1);
+   }
+ 
+   int ret = pcap_sendpacket(bmi->pcap, (unsigned char *) data, len);
++  if( ret )
++    fprintf(stderr, "Error sending packet: %s\n", pcap_geterr(bmi->pcap));
+ 
+   if( need_to_capture_tx_tstamp )
+     get_tx_timestamp( bmi->fd, ptr->tx_timestamp );
+diff --git a/targets/simple_switch/primitives.cpp b/targets/simple_switch/primitives.cpp
+index d4c452601..dcc94ca16 100644
+--- a/targets/simple_switch/primitives.cpp
++++ b/targets/simple_switch/primitives.cpp
+@@ -584,7 +584,7 @@ void ptp_counter_init(const bm::Data & b) {
+   }
+   table = table_init( cap );
+   pthread_mutex_init(&mutex, NULL);
+-  Logger::get()->info("Init ptp counter table size {}", cap);
++  Logger::get()->info("Initialized PTP counter table size {}", cap);
+ }
+ 
+ BM_REGISTER_EXTERN_FUNCTION(ptp_counter_init, const bm::Data &);
+@@ -593,7 +593,6 @@ BM_REGISTER_EXTERN_FUNCTION(ptp_counter_init, const bm::Data &);
+ class ptp_store_ingress_mac_tstamp
+   : public ActionPrimitive<Data &, const Data &, const Data &> {
+   void operator ()(Data &clockId, const Data &portId, const Data &sequenceId) {
+-    pthread_mutex_lock(&mutex); // Ensure thread safety
+     auto &packet = get_packet();
+ 
+     element_t elem, *ex;
+@@ -604,19 +603,21 @@ class ptp_store_ingress_mac_tstamp
+     elem.arrival_time = packet.ingress_mac_ts_ns;
+     elem.packet_id = packet.get_packet_id();
+ 
+-    Logger::get()->debug("Store ingress_mac_tstamp {} of clock_id={}, port_id={}, seq_id={} of packet {}",
+-        elem.arrival_time, elem.clock_id, elem.port_id, elem.sequence_id, elem.packet_id);
+-
++    pthread_mutex_lock(&mutex); // Ensure thread safety
+     //perhaps we got another packet having the same 3-tuple (clock_id, port_id, seq_id)
+     // => ignore the latest one
+     ex = table_find(table, elem.clock_id, elem.port_id, elem.sequence_id);
++    if( ex == NULL)
++      table_store(table, elem);
++    pthread_mutex_unlock(&mutex); // Ensure thread safety
++
+     if( ex != NULL)
+       Logger::get()->warn("Duplication detected (clock_id={}, port_id={}, seq_id={} was seen at packet {}). Ignore",
+           ex->clock_id, ex->port_id, ex->sequence_id, ex->packet_id);
+     else
+-      table_store(table, elem);
++      Logger::get()->debug("Stored ingress_mac_tstamp {} of clock_id={}, port_id={}, seq_id={} of packet {}",
++        elem.arrival_time, elem.clock_id, elem.port_id, elem.sequence_id, elem.packet_id);
+ 
+-    pthread_mutex_unlock(&mutex); // Ensure thread safety
+   }
+ };
+ 
+@@ -627,7 +628,7 @@ REGISTER_PRIMITIVE(ptp_store_ingress_mac_tstamp);
+ class ptp_capture_egress_mac_tstamp
+   : public ActionPrimitive<Data &, const Data &, const Data &> {
+   void operator ()(Data &clockId, const Data &portId, const Data &sequenceId) {
+-    pthread_mutex_lock(&mutex); // Ensure thread safety
++
+     auto &packet = get_packet();
+ 
+     //store a placeholder in the table if it is not existing
+@@ -638,19 +639,19 @@ class ptp_capture_egress_mac_tstamp
+     elem.sequence_id = sequenceId.get<uint16_t>();
+     elem.packet_id = packet.get_packet_id();
+ 
+-    Logger::get()->debug("Enable to capture egress_mac_tstamp of clock_id={}, port_id={}, seq_id={} of packet {}",
+-        elem.clock_id, elem.port_id, elem.sequence_id, elem.packet_id);
+-
++    pthread_mutex_lock(&mutex); // Ensure thread safety
+     //perhaps we got another packet having the same 3-tuple (clock_id, port_id, seq_id)
+     // this happens when ptp_store_ingress_mac_tstamp was called before this function
+     // => ignore
+     ex = table_find(table, elem.clock_id, elem.port_id, elem.sequence_id);
+     if( ex == NULL)
+       table_store(table, elem);
+-
++    pthread_mutex_unlock(&mutex); // Ensure thread safety
+ 
+     packet.need_to_capture_egress_mac_ts = true;
+-    pthread_mutex_unlock(&mutex); // Ensure thread safety
++
++    Logger::get()->debug("Enabled to capture egress_mac_tstamp of clock_id={}, port_id={}, seq_id={} of packet {}",
++        elem.clock_id, elem.port_id, elem.sequence_id, elem.packet_id);
+   }
+ };
+ REGISTER_PRIMITIVE(ptp_capture_egress_mac_tstamp);
+@@ -715,8 +716,8 @@ REGISTER_PRIMITIVE(ptp_get_egress_mac_tstamp);
+  * Get ingress_mac_tstamp of the current packet
+  */
+ class get_ingress_mac_tstamp
+-  : public ActionPrimitive<Data &, const Data &, const Data &, Data &> {
+-  void operator ()(Data &clockId, const Data &portId, const Data &sequenceId, Data &val) {
++  : public ActionPrimitive<Data &> {
++  void operator ()(Data &val) {
+     auto &packet = get_packet();
+     val.set( packet.ingress_mac_ts_ns );
+   }
+@@ -731,7 +732,6 @@ REGISTER_PRIMITIVE(get_ingress_mac_tstamp);
+ class ptp_get_ingress_mac_tstamp
+   : public ActionPrimitive<Data &, const Data &, const Data &, Data &> {
+   void operator ()(Data &clockId, const Data &portId, const Data &sequenceId, Data &val) {
+-    pthread_mutex_lock(&mutex); // Ensure thread safety
+ 
+     uint64_t clock_id = clockId.get<uint64_t>();
+     uint16_t port_id  = portId.get<uint16_t>();
+@@ -740,23 +740,27 @@ class ptp_get_ingress_mac_tstamp
+     uint64_t arrival_ts = 0;
+     element_t *elem;
+ 
++    pthread_mutex_lock(&mutex); // Ensure thread safety
+     elem = table_find( table, clock_id, port_id, sequence_id );
+     if( elem != NULL )
+       arrival_ts = elem->arrival_time;
++    pthread_mutex_unlock(&mutex); // Ensure thread safety
+ 
+-    Logger::get()->debug("Got arrival time {} of clock_id={}, port_id={}, seq_id={} of packet {}",
++    if (elem)
++      Logger::get()->debug("Got ingress_mac_tstamp {} of clock_id={}, port_id={}, seq_id={} of packet {}",
++        arrival_ts, elem->clock_id, elem->port_id, elem->sequence_id, elem->packet_id);
++    else
++      Logger::get()->warn("Not found ingress_mac_tstamp {} of clock_id={}, port_id={}, seq_id={} of packet {}",
+         arrival_ts, elem->clock_id, elem->port_id, elem->sequence_id, elem->packet_id);
+ 
+ 
+     val.set( arrival_ts );
+-    pthread_mutex_unlock(&mutex); // Ensure thread safety
+-
+   }
+ };
+ REGISTER_PRIMITIVE(ptp_get_ingress_mac_tstamp);
+ 
+ 
+-//this function is called by the switch after sending a packet to update its depature time
++//this function is called by the switch after sending a packet to updegress_mac_tstampate its depature time
+ void ptp_update_departure_time(uint64_t packet_id, uint64_t departure_time){
+   element_t *elem;
+ 
+@@ -769,8 +773,8 @@ void ptp_update_departure_time(uint64_t packet_id, uint64_t departure_time){
+ 
+   if( !elem )
+     Logger::get()->warn("No place for departure time. The packet %{} was not stored.", packet_id);
+-
+-  Logger::get()->debug("Store egress_mac_tstamp {} of clock_id={}, port_id={}, seq_id={} of packet {}",
++  else
++    Logger::get()->debug("Stored egress_mac_tstamp {} of clock_id={}, port_id={}, seq_id={} of packet {}",
+       departure_time, elem->clock_id, elem->port_id, elem->sequence_id, elem->packet_id);
+ 
+ };
+
+From be17de1d25b98c78ae037d86a465d197108e7ee7 Mon Sep 17 00:00:00 2001
+From: nhnghia <nhnghia@localhost>
+Date: Thu, 20 Feb 2025 13:48:48 +0100
+Subject: [PATCH 15/16] minimize modification
+
+---
+ .gitignore                 | 6 +-----
+ docs/simple_switch.md      | 8 ++++----
+ include/bm/bm_sim/packet.h | 1 +
+ include/bm/bm_sim/switch.h | 2 --
+ src/BMI/bmi_interface.c    | 2 +-
+ src/BMI/bmi_interface.h    | 2 +-
+ src/bm_sim/switch.cpp      | 2 --
+ 7 files changed, 8 insertions(+), 15 deletions(-)
+
+diff --git a/.gitignore b/.gitignore
+index 86c839188..1cab1a40c 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -104,8 +104,4 @@ VERSION-build
+ 
+ core
+ vgcore*
+-/.autotools
+-/.cproject
+-/.project
+-/.settings/
+-/.externalToolBuilders/
++
+diff --git a/docs/simple_switch.md b/docs/simple_switch.md
+index f958f46b8..ba1b76b0d 100644
+--- a/docs/simple_switch.md
++++ b/docs/simple_switch.md
+@@ -169,14 +169,14 @@ header_type intrinsic_metadata_t {
+ }
+ metadata intrinsic_metadata_t intrinsic_metadata;
+ ```
+-- `ingress_global_timestamp`: a timestamp, in microsecond since the Epoch, 
+-set when the packet arrives at the NIC which was assigned as an igress port. This
++- `ingress_global_timestamp`: a timestamp, in microseconds, set when the packet
++shows up on ingress. The clock is set to 0 every time the switch starts. This
+ field can be read directly from either pipeline (ingress and egress) but should
+ not be written to.  See Section [BMv2 timestamp implementation notes](#BMv2-timestamp-implementation-notes) for more details.
+ - `egress_global_timestamp`: a timestamp, in microseconds, set when the packet
+ starts egress processing. The clock is the same as for
+-- `ingress_system_timestamp`: a timestamp, in microsecond since the Epoch, 
+-set when the packet arrives at the NIC which was assigned as an igress port.
++`ingress_global_timestamp`. This field should only be read from the egress
++pipeline, but should not be written to.
+ - `mcast_grp`: needed for the multicast feature. This field needs to be written
+ in the ingress pipeline when you wish the packet to be multicast. A value of 0
+ means no multicast, and calling `mark_to_drop` will set the value to 0.
+diff --git a/include/bm/bm_sim/packet.h b/include/bm/bm_sim/packet.h
+index 51f97cb5f..cef9ceed2 100644
+--- a/include/bm/bm_sim/packet.h
++++ b/include/bm/bm_sim/packet.h
+@@ -391,6 +391,7 @@ class Packet final {
+   ErrorCode error_code{ErrorCode::make_invalid()};
+ 
+   bool checksum_error{false};
++
+  private:
+   static CopyIdGenerator *copy_id_gen;
+ };
+diff --git a/include/bm/bm_sim/switch.h b/include/bm/bm_sim/switch.h
+index 0a5af65d9..1c898ffa6 100644
+--- a/include/bm/bm_sim/switch.h
++++ b/include/bm/bm_sim/switch.h
+@@ -100,8 +100,6 @@ class Packet;
+ class SwitchWContexts : public DevMgr, public RuntimeInterface {
+   friend class Switch;
+ 
+-protected:
+-
+  public:
+   //! To enable live swapping of P4-JSON configurations, enable_swap needs to be
+   //! set to `true`. See switch.h documentation for more information on
+diff --git a/src/BMI/bmi_interface.c b/src/BMI/bmi_interface.c
+index dd3be2626..f2d24da7b 100644
+--- a/src/BMI/bmi_interface.c
++++ b/src/BMI/bmi_interface.c
+@@ -21,9 +21,9 @@
+ #include <string.h>
+ #include <stdlib.h>
+ #include <stdio.h>
+-#include <sys/socket.h>
+ 
+ #include <pcap/pcap.h>
++#include <sys/socket.h>
+ #include <errno.h>
+ #include <time.h>
+ #include <linux/net_tstamp.h>
+diff --git a/src/BMI/bmi_interface.h b/src/BMI/bmi_interface.h
+index 2ce047344..9cb04fe98 100644
+--- a/src/BMI/bmi_interface.h
++++ b/src/BMI/bmi_interface.h
+@@ -28,7 +28,7 @@ typedef enum
+     bmi_input_dumper,
+     bmi_output_dumper
+ }  bmi_dumper_kind_t;
+-
++  
+ int bmi_interface_create(bmi_interface_t **bmi, const char *device);
+ 
+ int bmi_interface_add_dumper(bmi_interface_t *bmi, const char *filename, bmi_dumper_kind_t dumper_kind);
+diff --git a/src/bm_sim/switch.cpp b/src/bm_sim/switch.cpp
+index 2acebf1c2..5110a4d0d 100644
+--- a/src/bm_sim/switch.cpp
++++ b/src/bm_sim/switch.cpp
+@@ -40,7 +40,6 @@
+ #include <boost/filesystem.hpp>
+ 
+ #include "md5.h"
+-#include "bmi_interface.h"
+ 
+ namespace fs = boost::filesystem;
+ 
+@@ -71,7 +70,6 @@ SwitchWContexts::receive(port_t port_num, const char *buffer, int len) {
+     Logger::get()->info("Received packet of length {} on port {}: {}",
+                         len, port_num, sample_packet_data(buffer, len));
+   }
+-
+   return receive_(port_num, buffer, len);
+ }
+ 
+
+From cb37c9bb3a180d10caeac91d39d1fb84566bf6c6 Mon Sep 17 00:00:00 2001
+From: nhnghia <nhnghia@localhost>
+Date: Thu, 20 Feb 2025 13:51:27 +0100
+Subject: [PATCH 16/16] minimize modification
+
+---
+ src/BMI/bmi_interface.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/BMI/bmi_interface.h b/src/BMI/bmi_interface.h
+index 9cb04fe98..a25f5ad0a 100644
+--- a/src/BMI/bmi_interface.h
++++ b/src/BMI/bmi_interface.h
+@@ -28,7 +28,7 @@ typedef enum
+     bmi_input_dumper,
+     bmi_output_dumper
+ }  bmi_dumper_kind_t;
+-  
++    
+ int bmi_interface_create(bmi_interface_t **bmi, const char *device);
+ 
+ int bmi_interface_add_dumper(bmi_interface_t *bmi, const char *filename, bmi_dumper_kind_t dumper_kind);
