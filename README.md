@@ -41,6 +41,8 @@ Specifically, the BMv2 virtual switch integrates seamlessly with the TAPRIO qdis
 
 In this experimentation, we use Ubuntu 22.04 which is installed inside a virtual machine.
 
+As we use P4 language to program the switch, we need to install its compiler, `p4c`, and its executer, BMv2:
+
 ### P4 compiler
 
 For further information, go [here](https://github.com/p4lang/p4c?tab=readme-ov-file#ubuntu-dependencies)
@@ -69,7 +71,7 @@ git clone https://github.com/p4lang/behavioral-model.git
 # apply our patch
 cd behaviral-model
 # the latest patch is available here: https://github.com/p4lang/behavioral-model/compare/main...montimage-projects:behavioral-model:main
-git checkout 199af48 #moment I tested BMv2
+git checkout 199af48 #same moment we patched BMv2
 git apply ../bmv2/bmv2.patch
 # compile and install
 ./autogen.sh && ./configure && make -j && sudo make install
@@ -77,17 +79,30 @@ git apply ../bmv2/bmv2.patch
 
 ### Testbed
 
+As an example, we will implement a virtual switch having an input port and an output port to connect a talker and a listener.
+
+<img src="img/testbed.png" />
+
+To implement this testbed in a single machine, we isolate talker and listener inside 2 namespaces to avoid they connect directly each other. Each namespace connects to the switch via a virtual Ethernet link. Each link acutally has 2 ends, like a virtual cable.
+One end is attached to the container and another end to the P4 virtual switch.
+
+
+
+
 We first create 2 namespaces, `talker` and `listener`:
 ```bash
 sudo ip netns add talker
 sudo ip netns add listener
 ```
 
+Create 2 virtual Ethernet links. 
 
 ```bash
 sudo ip link add veth-ta type veth peer name veth-tb
-sudo ip link add veth-la type veth peer name veth-lb numtxqueues 2
+sudo ip link add veth-la type veth peer name veth-lb
 ```
+
+We attach one of of each link to its corresponding container.
 
 ```bash
 sudo ip link set veth-ta netns talker
@@ -97,111 +112,78 @@ sudo ip link set veth-la netns listener
 We must also bring all interfaces up:
 
 ```bash
-sudo ip netns exec talker veth-ta up
-sudo ip netns exec listener veth-la up
+sudo ip netns exec talker   ip link set veth-ta up
+sudo ip netns exec listener ip link set veth-la up
 sudo ip link set veth-tb up
 sudo ip link set veth-lb up
 ```
 
+Then set IP addresses for talker and listener:
+
+```bash
+sudo ip netns exec talker   ip address add 10.0.0.1/24 dev veth-ta
+sudo ip netns exec listener ip address add 10.0.0.2/24 dev veth-la
+```
+
+```bash
+sudo ip netns exec talker   ethtool --offload veth-ta tx off
+sudo ip netns exec listener ethtool --offload veth-la rx off
+```
+
+VLAN PCP  -- skb priority -- TAPRIO traffic class -- output TX queue
+
+
+In this demo, we suppose that there are 2 traffic classes, TC0 and TC1 which will be mapped into 2 output transmit (TX) queues, thus we need to set number of TX queues to 2:
+
+```bash
+sudo ethtool -L veth-lb tx 2
+```
+
+Finally, we attach the TAPRIO qdisc to the output NIC:
+
 ```bash
 sudo tc qdisc replace dev veth-lb parent root handle 100 taprio \
-num_tc 2 \
-map 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 \
-queues 1@0 1@1 \
-base-time 1554445635681310809 \
-sched-entry S 01 100000000 sched-entry S 03 50000000 \
-clockid CLOCK_TAI
+     num_tc 2 \
+     map 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 \
+     queues 1@0 1@1 \
+     base-time 1554445635681310809 \
+     sched-entry S 01 100000000 sched-entry S 03 50000000 \
+     clockid CLOCK_TAI
 ```
+
+ Change queueing policy
+
+- `num_tc 2`: there are 2 traffic classes
+- `map 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0`: maps skb priorities 0..15 to a specified traffic class (TC). Specifically,
+    - map priority 0 (first bit from the left) to TC0
+    - map priority 1 to TC1
+    - and priorities 2-15 to TC0 (16 mappings for 16 possible traffic classes).
+
+- `queues 1@0 1@1`: map traffic classes to TX queues of the network device.
+ Its values use the format `count@offset`. Specifically,
+    - map the firs traffic class (TC0) to 1 queue strating at offset 0 (first queue)
+    - map the second traffic class (TC1) to 1 queue starting at offset 1 (second queue)
+
+- `sched-entry S 01 100000000 sched-entry S 03 50000000`: For the first 100ms, only the gate of 1st queue is opened. Then the next 50ms, gates of both 1st and 2nd queues are opended. This means that, TC0 is always open; TC1 is 100 ms closed and 50 ms open (cycle time is 150 ms).
+
+Figure below show how each output packet is classified and attributed to corresponding TX queue based on its PCP:
+
+<img src="img/map.png" />
+
+PCP is a 3-bit value, thus there are maximumally 8 traffic classes.
 
 ## Test
 
-
+We set 2 traffic classes TC0 and TC1 for TCP and UPD packets respectively.
 
 ```P4
-/* -*- P4_16 -*- */
-#include <core.p4>
-#include <v1model.p4>
-
-const bit<16> TYPE_IPV4 = 0x0800;
-const bit<16> TYPE_VLAN = 0x8100;
-
-typedef bit<48> macAddr_t;
-typedef bit<32> ip4Addr_t;
-
-header ethernet_t {
-    macAddr_t dstAddr;
-    macAddr_t srcAddr;
-    bit<16>   etherType;
-}
-
-header vlan_h {
-    bit<3> pcp;
-    bit<1> dei;
-    bit<12> vid;
-    bit<16> etherType;
-}
-
-
-header ipv4_t {
-    bit<4>    version;
-    bit<4>    ihl;
-    bit<8>    diffserv;
-    bit<16>   totalLen;
-    bit<16>   identification;
-    bit<3>    flags;
-    bit<13>   fragOffset;
-    bit<8>    ttl;
-    bit<8>    protocol;
-    bit<16>   hdrChecksum;
-    ip4Addr_t srcAddr;
-    ip4Addr_t dstAddr;
-}
-
-struct metadata {
-    /* empty */
-}
-
-struct headers {
-    ethernet_t   ethernet;
-    vlan_h       vlan;
-    ipv4_t       ipv4;
-}
-
-parser myParser(packet_in packet, out headers hdr,
-    inout metadata meta, inout standard_metadata_t std_data) {
-
-    state start {
-
-        packet.extract(hdr.ethernet);
-        transition select(hdr.ethernet.etherType){
-            TYPE_VLAN: parse_vlan; 
-            TYPE_IPV4: parse_ipv4;
-            default: accept;
-        }
-    }
-
-    state parse_vlan {
-        packet.extract(hdr.vlan);
-        transition select(hdr.vlan.etherType){
-            TYPE_IPV4: parse_ipv4;
-            default: accept;
-        }
-    }
-
-    state parse_ipv4 {
-        packet.extract(hdr.ipv4);
-        transition accept;
-    }
-}
-
-
-control myVerifyChecksum(inout headers hdr, inout metadata meta) {
-    apply {  }
-}
+// an array having only one element of 48 bits
+register <bit<48>>(1) last_tcp_packet_ts;
 
 control myIngress(inout headers hdr, inout metadata meta,
                   inout standard_metadata_t std_data) {
-
+    bit<48> ts;
+    bit<48> last_ts;
     apply {
         // naif routing
         if( std_data.ingress_port == 1 ){
@@ -217,33 +199,51 @@ control myIngress(inout headers hdr, inout metadata meta,
              hdr.ethernet.etherType = TYPE_VLAN;
          }
 
+         //get ingress timestamp (in microsecond) of the current packet
+         ts = std_data.ingress_global_timestamp;
          //dynamically adjust VLAN PCP
-         if( hdr.udp.dstPort == 6666 )
+         if( hdr.ipv4.protocol == TYPE_TCP ){
              hdr.vlan.pcp = 1;
-         else
-             hdr.vlan.pcp = 0;
+             // remember timestamp of the last TCP packet
+             //   to the first element of the array
+             last_tcp_packet_ts.write( 0, ts);
+         } else {
+             // get the timestamp from the first element of the array
+             last_tcp_packet_ts.read( last_ts, 0 );
+             if( ts - last_ts > 1*1000*1000 )
+                 hdr.vlan.pcp = 1;
+             else
+                 hdr.vlan.pcp = 0;
+         }
     }
 }
-
-control myEgress(inout headers hdr, inout metadata meta,
-                 inout standard_metadata_t std_data) {
-    apply {}
-}
-
-control myComputeChecksum(inout headers hdr, inout metadata meta) {
-     apply {}
-}
-
-control myDeparser(packet_out packet, in headers hdr) {
-    apply {
-        packet.emit(hdr.ethernet);
-        packet.emit(hdr.vlan);
-        packet.emit(hdr.ipv4);
-    }
-}
-
-//switch architecture
-V1Switch( 
-  myParser(), myVerifyChecksum(), myIngress(), myEgress(), myComputeChecksum(), myDeparser()
-) main;
 ```
+
+We need to compile the P4 code:
+
+```bash
+p4c --target  bmv2  --arch  v1model switch.p4
+```
+
+Then start the BMv2:
+
+```bash
+sudo simple_switch -i 1@veth-tb -i 2@veth-lb switch.json
+```
+
+Start 2 iperf3 servers:
+
+```bash
+sudo ip netns exec listener iperf3 -s -p 1000 &
+sudo ip netns exec listener iperf3 -s -p 2000 &
+```
+
+
+```bash
+sudo ip netns exec listener tcpdump -i veth-la -w trace.pcap --time-stamp-precision=nano --snap 100
+```
+
+
+```bash
+sudo ip netns exec talker iperf3 -c 10.0.0.2 -p 1000 -t 4 -b 10M &
+sudo ip netns exec talker iperf3 -c 10.0.0.2 -p 2000 -t 4 -b 10M -u
