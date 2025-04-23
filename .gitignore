@@ -3,3 +3,4 @@
 switch.p4i
 switch.json
 *.pcap
+/.externalToolBuilders/
