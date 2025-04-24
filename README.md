@@ -72,6 +72,12 @@ In this experimentation, we use Ubuntu 22.04 which is installed inside a Dell la
 
 As we use P4 language to program the switch, we need to install its compiler, `p4c`, and its executor, BMv2:
 
+First of all, we need to clone the supported elements:
+
+```bash
+git clone https://github.com/DETERMINISTIC6G/det6g-blog-prog-soft-tsn-switch.git
+```
+
 ### P4 compiler
 
 For further information, go [here](https://github.com/p4lang/p4c?tab=readme-ov-file#ubuntu-dependencies)
