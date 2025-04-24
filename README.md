@@ -1,26 +1,34 @@
-# A P4-Programmable Software TSN Switch for Deterministic Networking
+# Building a Programmable Software TSN Switch with P4
 
-In this post, we present a software TSN switch which is programmable using P4 language to control its behaviour from the data plane at runtime.
+Time-Sensitive Networking (TSN) enhances traditional Ethernet with capabilities for reliable and predictable communication. It's widely used in systems where precise timing and low latency are critical, such as industrial automation, automotive networks, and professional media streaming.
 
-# tl;dr - Takeaway Messages
+One key component of TSN is the Time-Aware Shaper (TAS), which schedules traffic based on time slots to ensure that critical data is delivered exactly when needed. Traditionally, implementing TSN features like TAS required specialized hardware. However, recent developments in the Linux kernel have introduced native support for some TSN capabilities, such as [TAPRIO](https://www.man7.org/linux/man-pages/man8/tc-taprio.8.html) (Time-Aware Priority Scheduler).
 
-- The Time-Aware Priority shaper (TAPRIO) is one technology to implement the Time-Aware Shaper (TAS) on Linux software bridges.
-- Data plane is programable using P4 language
-- The combination of TAPRIO qdsic and P4 can provide a flexiblility on TSN
+This blog explores how to build a software-based TSN switch that's not only fully functional but also programmable using the P4 language. This combination brings the benefits of deterministic networking to a flexible, software-defined environment.
+
+
+# Takeaway Messages
+
+- A fully software-based TSN switch is now possible using Linux's built-in TSN capabilities. This opens up opportunities for testing and prototyping TSN features without requiring specialized hardware.
+
+- By combining Linux's traffic shaping features with P4 programmability, we can create a TSN switch that reacts more intelligently and quickly to changing network conditions, offering better performance and control than traditional setups.
+
+
 
 # Motivation
 
 ### Motivation for Building a Programmable TSN Switch  
 
-Time-Sensitive Networking (TSN) is a crucial technology for achieving deterministic communication in various domains, including industrial automation, automotive networks, and telecommunications. However, traditional TSN implementations typically rely on hardware-specific devices, limiting their flexibility and adaptability.
+TSN has traditionally relied on dedicated hardware that supports precise timing and scheduling. While powerful, such hardware is often costly and lacks flexibility. In response, recent versions of the Linux kernel have introduced support for features like TAPRIO qdisc, which allow time-aware traffic shaping in software.
 
-To bridge this gap, the Linux kernel has recently integrated several TSN-related features, such as the Time-Aware Traffic Shaper (TAPRIO) qdisc, enabling software-based TSN capabilities. By leveraging these features, it is possible to construct a software-based TSN bridge, as demonstrated in our previous [blog post](https://blog.deterministic6g.eu/posts/2024/11/02/software_tsn_switch.html). However, this software bridge comes with some limitations:
+Building on this, our earlier [blog post](https://blog.deterministic6g.eu/posts/2024/11/02/software_tsn_switch.html) showed how to configure a Linux bridge as a basic TSN switch. However, that approach had some limitations:
 
-- Cumbersome: It relies on additional components, such as `qdisc` and `tc` filters, to classify traffic, making configuration and management.
+- Cumbersome configuration: It relies on auxiliary components, like `qdisc` and `tc` filters, to classify traffic, making configuration and management.
 
-- Inflexibility: The bridge's behavior is controlled via the `tc` tool from the control plane, which may introduce delays when rapid traffic adaptation is required.
+- Limited flexibility: The bridge's behavior is controlled via the `tc` tool from the control plane, which may introduce delays when rapid traffic adaptation is required.
 
-In this blog post, we introduce a software TSN switch programmable with P4, combining the deterministic features of TSN with the flexibility and programmability of P4-enabled data planes. Our switch is built on Linux’s TAPRIO qdisc, which is essential for traffic shaping in TSN environments. By integrating P4 programmability, the switch enables dynamic traffic management, including real-time packet classification, adaptive scheduling, and in-depth network monitoring. This approach provides a more agile, scalable, and customizable solution for modern deterministic networking needs.
+
+To overcome these limitations, we introduce a programmable software TSN switch built on Linux's existing TSN features, with added programmability using the P4 language. This allows dynamic, real-time control of packet behavior directly from the data plane.
 
 
 # Background
@@ -42,7 +50,7 @@ At the core of this paradigm is, a domain-specific language designed for program
 
 P4 programs are compiled to run on a variety of targets, including software switches (e.g., BMv2), programmable hardware switches based on FPGAs, or ASICs. By decoupling packet processing logic from underlying hardware, P4 empowers researchers and network engineers to rapidly prototype and deploy new networking functionalities, thereby accelerating the evolution of modern, intelligent networks.
 
-# A P4-Programmable Software TSN switch
+# A P4-based Programmable Software TSN switch
 
 The P4 software switch (BMv2) is the key component, serving as the data plane responsible for packet processing. By utilizing the P4 programming language, the switch allows users to define at runtime how packets are processed, classified, forwarded them to appropriate qdisc ports. This programmability removes the dependency on manual traffic control commands, e.g., `tc`, enabling flexible and runtime adjustments. 
 
@@ -293,6 +301,6 @@ We obtain the following figure which shows the arrival time of packets at the li
 
 Each packet is drawn by a vertical line. The traffic throughput of each traffic class is 1Mbps with total 789 packets. 
 
-We can see that time-aware shaping is effective and works correctly. During the first 3 seconds, the two traffic classes, TC0 and TC1, are generated at the same time but the latter is available on its timeslots of 50 ms for each 150 ms as we setup in the TAPRIO qdisc above. Once TC0 is ended after 3 seconds, its timeslots are not used while TC1 still continues using its timeslots.
-After 1 second, TC1 uses all available timeslots.
+We can see that time-aware shaping is effective and works correctly. During the first 3 seconds, the two traffic classes, TC0 and TC1, are generated at the same time but the latter is available on its time slots of 50 ms for each 150 ms as we setup in the TAPRIO qdisc above. Once TC0 is ended after 3 seconds, its time slots are not used while TC1 still continues using its time slots. The egress link is used only 1/3 capability during this interval.
+After 1 second, TC1 uses all available time slots.
  
