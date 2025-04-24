@@ -33,39 +33,37 @@ To overcome these limitations, we introduce a programmable software TSN switch b
 
 # Background
 
-
 ## TSN
 
 TSN is a set of IEEE 802.1 standards that extend Ethernet to support deterministic communication with bounded latency, low jitter, and minimal packet loss. 
 
 TAS is one of the core components of TSN, defined in IEEE 802.1Qbv, to enable time-division-based scheduling of network traffic by assigning transmission gates to traffic queues, which open and close according to a periodic schedule synchronized across the network. This allows critical traffic to be transmitted at precise time intervals, ensuring predictability.
 
-To have an idea of TSN and TAS, please refer to our [previous post](https://blog.deterministic6g.eu/posts/2024/11/02/software_tsn_switch.html).
 
 ## P4: Programming Protocol-independent Packet Processors
 
-Programmable data planes fundamentally change the architecture of network devices by enabling direct control over packet processing logic at the forwarding layer. Unlike traditional fixed-function switches that rely on pre-defined behaviors hardcoded in silicon, programmable data planes allow users to  define how packets are processed directly within the network forwarding hardware or software. 
+Programmable data planes fundamentally change the architecture of network devices by enabling direct control over packet processing logic at the forwarding layer. Unlike traditional fixed-function switches that rely on pre-defined behaviors hardcoded in hardware, programmable data planes allow users to  define how packets are parsed, matched, modified and forwarded. 
 
-At the core of this paradigm is, a domain-specific language designed for programming the behavior of the data plane. P4 enables developers to describe how packets are parsed, matched, and modified within a switch or network device in a protocol-agnostic manner. Its core abstractions—such as headers, parsers, match-action tables, and control flow—make it possible to define custom packet processing pipelines. 
+The core of this paradigm is P4, a domain-specific language. In contrast to a general purpose language such as C or Python, P4 is optimized for network data processing.
+P4 programs are compiled to run on a variety of targets, including software switches (e.g., BMv2), programmable hardware switches based on FPGAs, or ASICs.
 
-P4 programs are compiled to run on a variety of targets, including software switches (e.g., BMv2), programmable hardware switches based on FPGAs, or ASICs. By decoupling packet processing logic from underlying hardware, P4 empowers researchers and network engineers to rapidly prototype and deploy new networking functionalities, thereby accelerating the evolution of modern, intelligent networks.
 
 # A P4-based Programmable Software TSN switch
 
-The P4 software switch (BMv2) is the key component, serving as the data plane responsible for packet processing. By utilizing the P4 programming language, the switch allows users to define at runtime how packets are processed, classified, forwarded them to appropriate qdisc ports. This programmability removes the dependency on manual traffic control commands, e.g., `tc`, enabling flexible and runtime adjustments. 
+The P4 software switch (BMv2) is the key component, serving as the data plane responsible for packet processing. By utilizing the P4 programming language, we remove the dependency on manual traffic control commands, e.g., `tc`, enabling flexible and runtime adjustments. 
 
 <img src="./img/switch.png" width="450px" />
 
-Specifically, we integrate seamlessly the BMv2 with the TAPRIO qdisc by leveraging Linux packet priority. When a packet enters the BMv2, it undergoes a parsing process defined by the P4 program. This parsing step allows users to extract relevant fields from the packet header and perform logical processing as required. For instance, operations like In-band Network Telemetry (INT) can be implemented to monitor the packet's journey through the network, collecting data on latency, jitter, or path utilization. 
+Specifically, we integrate seamlessly the BMv2 with the TAPRIO qdisc. When a packet enters the BMv2, it undergoes a parsing process defined by the P4 program. This parsing step allows us to extract relevant fields from the packet header and perform logical processing as required. For instance, operations like In-band Network Telemetry (INT) can be implemented to monitor the packet's journey through the network, collecting data on latency, jitter, etc. 
 
-After completing the logical processing, the VLAN Priority Code Point (PCP) in the packet header is updated to reflect. Simultaneously, BMv2 updates the `skb->priority` value of the packet in the Linux kernel. The TAPRIO qdisc uses this `skb->priority` value to determine the appropriate traffic class for the packet. The packets of a same traffic class will be sent to the same output transmit (TX) queue, aligning it with the preconfigured time slots defined in the time-aware schedule.
+After completing the logical processing, the VLAN Priority Code Point (PCP) in the packet header is updated to reflect its traffic class. Simultaneously, BMv2 updates the `skb->priority` value of the packet in the Linux kernel. The TAPRIO qdisc uses this `skb->priority` value to determine the appropriate traffic class for the packet. The packets of a same traffic class will be sent to the same output transmit (TX) queue, aligning it with the preconfigured time slots defined in the time-aware schedule.
 
 
 Figure below show how each output packet is classified and attributed to corresponding TX queue based on its PCP:
 
 <img src="img/map.png" width="650px"/>
 
-PCP is a 3-bit value, thus there are maximumally 8 traffic classes. By dynamically changing PCP of a packet, we can control its TX queue, thus shape egress traffic. This approach eliminates the need for static configurations or manual intervention, offering greater flexibility in handling diverse traffic patterns at runtime.
+As PCP is a 3-bit value, there are maximumally 8 traffic classes. By dynamically changing PCP of a packet, we can control its TX queue, thus shape the egress traffic. This approach eliminates the need for static configurations or manual intervention, offering a flexibility in handling diverse traffic patterns at runtime.
 
 
 ## Environment Setup
@@ -114,9 +112,7 @@ As an example, we will implement a software TSN switch having an input port and 
 
 <img src="img/testbed.png" width="500px" />
 
-To implement this testbed in a single machine, we need to isolate the talker and listener inside 2 containers to avoid they connect directly each other. Each container, that is typically a Linux namespace, connects to the TSN switch via a virtual Ethernet link. 
-Like a cable, a link acutally has 2 ends. When a packet is sent to an end, it is available on another end.
-
+To implement this testbed on a single machine, the talker and listener are isolated in two separate containers to prevent direct communication between them. Each container, that is typically a Linux namespace, connects to the switch via a virtual Ethernet link that, like a cable, acutally has 2 ends. When a packet is sent to one end, it becomes available at the other.
 
 
 We first create 2 namespaces, `talker` and `listener`:
@@ -199,14 +195,12 @@ The essensital parameters are as below:
 
 ## Test
 
-Based on the schedule configured in the TAPRIO qdisc above, we can see that the TC0 packets can be always sent to the egress link, while the TC1 packets can be sent out only during 50 ms for each 150 ms.
-This configuration wastes probably egress link's bandwidth when there is only TC1 packets. 
+Based on the TAPRIO qdisc configuration described above, TC0 packets can be transmitted at any time, whereas TC1 packets are allowed to transmit only during a 50 ms window in each 150 ms cycle. This setup may lead to underutilization of the egress link's bandwidth, especially when only TC1 packets are present.
 
-In this test, we will show that TC1 can use the TX queue of TC0 if the TX queue has not used during the last 1 second. For the sake of simplicity, we set TC0 for UDP packets having destination port 1000 and other to TC1. We choose UDP packets rather than TCP to avoid being influenced by TCP congestion algorithm.
+In this test, we demonstrate that TC1 traffic can opportunistically use TC0's transmission queue if it has remained idle for more than one second. For simplicity, we assign UDP packets with destination port 1000 to TC0, and all other traffic to TC1. We use UDP instead of TCP to avoid the influence of TCP's congestion control mechanisms which may impact traffic rate.
 
-The switch's behavior is controlled by [switch.p4](./switch.p4) program. It contains different `control` to parse Ethernet, VLAN, IPv4, UDP protocols; perform a simple packet routing; and adjust dynamically PCP value of a packet.
-We do not go into detail all these `control` due the lack of space. Let's just have a look at the most interesting part, PCP adjustment of packets, as shown in the following snippet. 
-
+The switch's behavior is controlled by [switch.p4](./switch.p4) program. It contains multiple `control` blocks to parse Ethernet, VLAN, IPv4, UDP headers; perform basic routing; and dynamically adjust PCP value of each packet.
+While we won't cover all of these components due to space constraints, let's focus on the most relevant and interesting part, dynamic PCP adjustment, as shown in the snippet below:
 
 ```P4
 //an array having only one element of 48 bits
@@ -250,12 +244,11 @@ control myEgress(inout headers hdr, inout metadata meta,
 
 We begin by declaring a *global* variable named `last_tc0_packet_ts` to record the ingress timestamp of the most recent TC0 packet observed.
 
-The main logic is implemented inside `apply` block. It first ensures that a VLAN header is present in the output packet. Then, if the current packet is a UDP packet and its destination port is 1000, its PCP field is set to 0, i.e., its traffic class is TC0. For other packet, we compare its ingress timestamp with the timestamp of the last seen TC0 packet. If more than 1 second has passed, the PCP is set to 0; otherwise, it is set to 1. 
-The code is enclosed inside an `atomic` block to ensure the `write` and `read` operators of the global variable  are `last_tc0_packet_ts` sequentially executed.
+The core logic is implemented inside the `apply` block. It first ensures that a VLAN header is present in the output packet. Next, if the current packet is a UDP packet with destination port 1000, its PCP field is set to 0, indicating traffic class TC0. For all other packets, the switch compares the current packet's ingress timestamp with the timestamp of the last observed TC0 packet. If more than 1 second has elapsed, the packet is treated as TC0 by setting its PCP to 0; otherwise, it is classified as TC1 by setting the PCP to 1. 
 
-Such a behavior effectively provides a simple, time-based packet prioritization mechanism using programmable data plane features.
+This logic is enclosed within an `atomic` block to ensure that the `write` and `read` operations on the global variable `last_tc0_packet_ts` are executed sequentially and consitently.
 
-
+This mechanism effectively implements a simple, time-aware packet prioritization strategy directly in the programmable data plane, enabling more flexible traffic handling without relying on the control plane.
 
 We need to compile the P4 code:
 
@@ -295,12 +288,14 @@ Stop tcpdump, then plot the traffic shapping:
 python3 ./plot.py
 ```
 
-We obtain the following figure which shows the arrival time of packets at the listener:
+We obtain the following figure which illustrates the arrival times of packets at the listener:
 
 <img src="img/arrival_time.png" />
 
-Each packet is drawn by a vertical line. The traffic throughput of each traffic class is 1Mbps with total 789 packets. 
+Each vertical line represents the arrival of a single packet. The traffic throughput for each traffic class is set to 1 Mbps, resulting in a total of 789 packets transmitted during the experiment.
 
-We can see that time-aware shaping is effective and works correctly. During the first 3 seconds, the two traffic classes, TC0 and TC1, are generated at the same time but the latter is available on its time slots of 50 ms for each 150 ms as we setup in the TAPRIO qdisc above. Once TC0 is ended after 3 seconds, its time slots are not used while TC1 still continues using its time slots. The egress link is used only 1/3 capability during this interval.
-After 1 second, TC1 uses all available time slots.
- 
+The results confirm that TAS is effective and functions as expected. During the first 3 seconds, both traffic classes, TC0 and TC1, are active. As configured in the TAPRIO qdisc, TC1 is transmitted only within its allocated 50 ms time slots in each 150 ms cycle, while TC0 packets are sent without restriction.
+
+After 3 seconds, TC0 traffic ends, leaving its time slots unused. During this period, TC1 continues to transmit only during its scheduled windows, resulting in the egress link being utilized at only one-third of its capacity.
+
+However, after 1 additional second, the system detects that TC0 has been inactive, and TC1 begins to utilize all available time slots, demonstrating the switch's ability to opportunistically reuse idle transmission queues to improve bandwidth efficiency.
