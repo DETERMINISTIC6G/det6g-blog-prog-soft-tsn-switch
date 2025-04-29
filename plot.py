@@ -23,7 +23,7 @@ data = {"UDP:1000": [], "Other": []}
 print("loading packets' timestamp ...")
 first_time = 0
 # range of 1 second
-RANGE = [0, 6]
+RANGE = [2, 5]
 #RANGE = [0, 1000000]
 # Iterate over the packets
 for pkt in packets:
@@ -62,18 +62,20 @@ for pkt in packets:
 
 print("plotting ...")
 # Plotting
-plt.figure(figsize=(12, 3))
+plt.figure(figsize=(10, 3))
+plt.margins(x=0.01) #reduce margin
 
 # Create a colormap for the different ports
 colors = {"UDP:1000": "red", "Other": "blue"}
+labels = {"UDP:1000": "TC0 (UDP:1000)", "Other": "TC1 (Other)"}
 
 # Assign a color for each port and plot its vertical lines
 for proto in data:
-    plt.vlines(data[proto], ymin=0, ymax=1, colors=colors[proto], alpha=0.6, label=proto)
+    plt.vlines(data[proto], ymin=0, ymax=1, colors=colors[proto], alpha=0.6, label=labels[proto])
 
 # Formatting the plot
-plt.title('Packet Arrival Times')
-plt.xlabel('Arrival Time (s)') #nanosecond
+#plt.title('Packet Arrival Times')
+plt.xlabel('Packet Arrival Time (s)') #nanosecond
 plt.ylabel(None)
 # Hide y-axis ticks and tick labels
 plt.tick_params(axis='y', which='both', left=False, labelleft=False)
@@ -81,6 +83,6 @@ plt.tick_params(axis='y', which='both', left=False, labelleft=False)
 # Set x-axis ticks every 0.5 units
 plt.xticks(np.arange(RANGE[0], RANGE[1], 0.5))  # From 0 to 5, step 0.5
 
-plt.legend(loc='upper right', bbox_to_anchor=(1.15, 1))
+plt.legend(loc='upper right') #, bbox_to_anchor=(1.15, 1))
 #plt.grid(True)
 plt.savefig( "arrival_time.png", dpi=200, format='png', bbox_inches='tight')
